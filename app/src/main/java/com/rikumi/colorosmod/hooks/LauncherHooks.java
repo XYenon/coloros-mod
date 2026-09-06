@@ -352,6 +352,10 @@ public final class LauncherHooks {
         hookRecentsShowHidden(lpparam);
         // Feature 19 — 多任务不显示小窗应用: 始终注入, 运行时按 KEY_RECENTS_HIDE_FREEFORM_ENABLED 门控。
         hookRecentsHideFreeform(lpparam);
+        // 多任务隐藏未在运行的应用: 始终注入, 运行时按 KEY_RECENTS_HIDE_NOT_RUNNING_ENABLED 门控。
+        hookRecentsHideNotRunning(lpparam);
+        // 多任务上划彻底结束进程: 始终注入, 运行时按 KEY_RECENTS_SWIPE_UP_KILL_ENABLED 门控。
+        hookRecentsSwipeUpKill(lpparam);
 
         // 隐藏应用文件夹标题显示用户自定义文件夹名: 标题由 DeepProtectedAppsManager
         // #createVirtualFolder() 硬编码为 R.string.app_hidden_title, hook 它并在返回后把
@@ -1094,6 +1098,363 @@ public final class LauncherHooks {
         } catch (Throwable t) {
             log("HOOK FAIL OplusRecentTasksFilter#filterTaskInfo :: " + Log.getStackTraceString(t));
         }
+    }
+
+    // 多任务隐藏未在运行的应用: 剔除已经没有存活 Activity 的任务卡片。
+    // 判据 android.app.TaskInfo#isRunning(PUBLIC boolean, 已 dexdump 核对):
+    // system_server 侧 Task#fillTaskInfo 里 info.isRunning = (top != null), 即任务是否还有
+    // 存活的 Activity; 应用被杀/任务被销毁后为 false, 卡片留在最近任务里但已不"运行"。
+    // 分屏任务(taskInfo2 != null)要求两个任务都不在运行才隐藏, 避免误杀掉一半的组合。
+    public static void hookRecentsHideNotRunning(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            final String flag = KEY_RECENTS_HIDE_NOT_RUNNING_ENABLED;
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.quickstep.data.OplusRecentTasksFilter",
+                    lpparam.classLoader, "filterTaskInfo",
+                    int.class, int.class,
+                    "com.android.wm.shell.shared.GroupedTaskInfo",
+                    "java.util.ArrayList",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!readBool(flag, false)) return;
+                                Object gti = param.args[2];
+                                if (gti == null) return;
+                                if (isTaskInfoRunning(gti, "getTaskInfo1")) return;
+                                // 分屏: 另一半还在运行就保留
+                                if (isTaskInfoRunning(gti, "getTaskInfo2")) return;
+                                param.setResult(true); // 剔除该任务卡片
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("HOOK OK OplusRecentTasksFilter#filterTaskInfo (recents hide not running)");
+        } catch (Throwable t) {
+            log("HOOK FAIL OplusRecentTasksFilter#filterTaskInfo (hide not running) :: "
+                    + Log.getStackTraceString(t));
+        }
+    }
+
+    // 该 GroupedTaskInfo 里指定的那一半任务是否还在运行; 取不到(单任务时 taskInfo2 为 null)
+    // 视为不在运行, 由调用方决定是否隐藏。
+    private static boolean isTaskInfoRunning(Object groupedTaskInfo, String getter) {
+        try {
+            Object taskInfo = XposedHelpers.callMethod(groupedTaskInfo, getter);
+            if (taskInfo == null) return false;
+            return XposedHelpers.getBooleanField(taskInfo, "isRunning");
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    // 多任务上划彻底结束进程。
+    // 上划卡片的完整链路(网格/栈/堆叠三种布局统一):
+    //   TaskViewTouchController(上划) -> OplusRecentsViewImpl#createTaskDismissAnimation
+    //   -> delegate(Stack/Grid/Tile) -> RecentsViewAnimUtil 的 dismiss 动画结束监听
+    //   -> handleSuccessfulDismiss -> createTaskRemovalRunnable -> OplusRecentsViewImpl#removeTask
+    //   -> KillAppWrapper.forceStopTasks(ctx, task) -> (异步执行器)
+    //   -> KillAppWrapper#forceStopAppList(ctx, list, null, false) -> athena type=13(STOP)。
+    // forceStopAppList 是唯一收口, 末位 boolean 决定请求类型: false=13(STOP, 只停任务)、
+    // true=11(KILL_OR_STOP, 杀进程)。两条下发路径(Osense 新 API 与 startService 老 API)都读它。
+    // 注意 forceStopTasks 是提交到 OplusExecutors 异步执行的, ThreadLocal/调用栈都跨不了线程,
+    // 所以只能在 forceStopAppList 本身上按开关改写入参。
+    //
+    // 真正结束进程不在这里做: Launcher 没权限(见下文 requestForceStop)。本方法只负责
+    //   (a) 补调 removeTask 让卡片消失(newApiSupport 时系统自己会跳过),
+    //   (b) 决定要不要强杀、杀整包还是只杀这一个任务。
+    // 判定口径:
+    //   主任务 + 附属开关开 -> 连同该包剩余附属任务一起移除, 并整包强杀;
+    //   附属任务           -> 只定向杀它自己所在进程, 主进程要留着;
+    //   两者都判定不了     -> 退回"同包没有别的卡片才整包强杀"。
+    private static final ThreadLocal<String> sPendingKillPkg = new ThreadLocal<>();
+    // 本次被划掉的任务 id(不论杀不杀进程, 卡片都必须移除, 否则划不掉)
+    private static final ThreadLocal<Integer> sPendingRemoveId = new ThreadLocal<>();
+    // 划掉主任务时, 需要一起移除的附属任务 id
+    private static final ThreadLocal<java.util.List<Integer>> sPendingExtraTaskIds =
+            new ThreadLocal<>();
+    // 划掉附属任务时, 只定向杀掉它自己所在进程(不能整包强杀, 否则主进程会一起没)
+    private static final ThreadLocal<Integer> sPendingKillTaskId = new ThreadLocal<>();
+
+    public static void hookRecentsSwipeUpKill(final XC_LoadPackage.LoadPackageParam lpparam) {
+        // (1) 单卡上划
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.quickstep.views.OplusRecentsViewImpl",
+                    lpparam.classLoader, "removeTask",
+                    "com.android.quickstep.views.TaskView",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                sPendingKillPkg.set(null);
+                                sPendingRemoveId.set(null);
+                                sPendingExtraTaskIds.set(null);
+                                sPendingKillTaskId.set(null);
+                                boolean kill =
+                                        readBool(KEY_RECENTS_SWIPE_UP_KILL_ENABLED, false);
+                                boolean subsidiary = readBool(
+                                        KEY_RECENTS_SWIPE_UP_KILL_SUBSIDIARY_ENABLED, false);
+                                if (!kill && !subsidiary) return;
+                                Object task = XposedHelpers.callMethod(param.args[0], "getTask");
+                                if (task == null) return;
+                                Object key = XposedHelpers.getObjectField(task, "key");
+                                if (key == null) return;
+                                String pkg = (String) XposedHelpers.callMethod(
+                                        key, "getPackageName");
+                                if (pkg == null || pkg.isEmpty()) return;
+                                int taskId = (Integer) XposedHelpers.getObjectField(key, "id");
+                                // 卡片必须无条件移除(见 after), 否则划掉它不会消失。
+                                sPendingRemoveId.set(taskId);
+
+                                // 主/附属判定: 任务的根组件是否属于该包的 launcher 入口。
+                                Boolean main = subsidiary
+                                        ? isMainTask((Context) XposedHelpers.callMethod(
+                                                param.thisObject, "getContext"), key)
+                                        : null;
+
+                                if (Boolean.TRUE.equals(main)) {
+                                    // 划掉主任务: 连同该包剩余的附属任务一起清掉
+                                    java.util.List<Integer> others =
+                                            new java.util.ArrayList<>();
+                                    collectTaskIdsOfPkg(param.thisObject, pkg, others, taskId);
+                                    if (!others.isEmpty()) {
+                                        sPendingExtraTaskIds.set(others);
+                                        // 清完附属任务后该包一个不剩, 整包强杀。
+                                        // 本开关的语义就是 "kill + 从最近任务移除", 所以不额外
+                                        // 再要求"彻底结束进程"开关; 没有附属任务时才退回那个开关。
+                                        sPendingKillPkg.set(pkg);
+                                        return;
+                                    }
+                                } else if (kill && Boolean.FALSE.equals(main)) {
+                                    // 划掉附属任务: 只杀它自己所在进程, 主进程要留着
+                                    sPendingKillTaskId.set(taskId);
+                                    return;
+                                }
+                                if (kill && countTaskViewsOfPkg(param.thisObject, pkg) <= 1) {
+                                    // 常规规则: 同包没有别的卡片才整包强杀
+                                    sPendingKillPkg.set(pkg);
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                String pkg = sPendingKillPkg.get();
+                                Integer removeId = sPendingRemoveId.get();
+                                java.util.List<Integer> extra = sPendingExtraTaskIds.get();
+                                Integer killTaskId = sPendingKillTaskId.get();
+                                sPendingKillPkg.set(null);
+                                sPendingRemoveId.set(null);
+                                sPendingExtraTaskIds.set(null);
+                                sPendingKillTaskId.set(null);
+                                if (removeId == null) return;
+                                Context ctx = (Context) XposedHelpers.callMethod(
+                                        param.thisObject, "getContext");
+                                // newApiSupport()==true 时系统自己跳过 removeTask, 只把请求
+                                // 交给 athena(不执行), 卡片不消失, 这里补调一次。
+                                // 不论后面要不要杀进程, 卡片都必须移除, 否则划掉它不会消失。
+                                Object amw = XposedHelpers.callStaticMethod(
+                                        XposedHelpers.findClass(
+                                                "com.android.systemui.shared.system.ActivityManagerWrapper",
+                                                lpparam.classLoader),
+                                        "getInstance");
+                                XposedHelpers.callMethod(amw, "removeTask", removeId);
+                                // 划掉主任务时, 附属任务一并从最近任务里移除
+                                if (extra != null) {
+                                    for (Integer id : extra) {
+                                        XposedHelpers.callMethod(amw, "removeTask", id);
+                                    }
+                                }
+                                if (pkg != null) {
+                                    requestForceStop(ctx, pkg);
+                                } else if (killTaskId != null) {
+                                    requestKillTask(ctx, killTaskId);
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("HOOK OK OplusRecentsViewImpl#removeTask (recents swipe up kill)");
+        } catch (Throwable t) {
+            log("HOOK FAIL OplusRecentsViewImpl#removeTask (recents swipe up kill) :: "
+                    + Log.getStackTraceString(t));
+        }
+
+        // (2) 点击"全部清除": 系统只会把未锁定的卡片划掉, 这里算出哪些包会被清空并强杀。
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.quickstep.views.OplusRecentsViewImpl",
+                    lpparam.classLoader, "dismissAllTasks",
+                    View.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!readBool(KEY_RECENTS_SWIPE_UP_KILL_ENABLED, false)) return;
+                                Context ctx = (Context) XposedHelpers.callMethod(
+                                        param.thisObject, "getContext");
+                                // 被锁定的卡片不会被清掉, 所以这些包清除后仍有任务, 不能杀。
+                                java.util.Set<String> keep = new java.util.HashSet<>();
+                                java.util.Set<String> all = new java.util.HashSet<>();
+                                int n = (Integer) XposedHelpers.callMethod(
+                                        param.thisObject, "getTaskViewCount");
+                                for (int i = 0; i < n; i++) {
+                                    Object tv = XposedHelpers.callMethod(
+                                            param.thisObject, "getTaskViewAt", i);
+                                    if (tv == null) continue;
+                                    Object task = XposedHelpers.callMethod(tv, "getTask");
+                                    if (task == null) continue;
+                                    Object key = XposedHelpers.getObjectField(task, "key");
+                                    if (key == null) continue;
+                                    String pkg = (String) XposedHelpers.callMethod(
+                                            key, "getPackageName");
+                                    if (pkg == null || pkg.isEmpty()) continue;
+                                    all.add(pkg);
+                                    if (isLockedTaskView(tv, lpparam)) keep.add(pkg);
+                                }
+                                // 附属任务与主任务同包, 只要该包有未锁定的卡片, 全部清除就会
+                                // 把它们一起划掉, 清完之后整包一个不剩 -> 杀。
+                                for (String pkg : all) {
+                                    if (!keep.contains(pkg)) requestForceStop(ctx, pkg);
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("HOOK OK OplusRecentsViewImpl#dismissAllTasks (recents swipe up kill)");
+        } catch (Throwable t) {
+            log("HOOK FAIL OplusRecentsViewImpl#dismissAllTasks (recents swipe up kill) :: "
+                    + Log.getStackTraceString(t));
+        }
+
+        try {
+            Class<?> killWrapper = XposedHelpers.findClass(
+                    "com.oplus.quickstep.memory.KillAppWrapper", lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(killWrapper, "forceStopAppList",
+                    Context.class, java.util.ArrayList.class, String.class, boolean.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!readBool(KEY_RECENTS_SWIPE_UP_KILL_ENABLED, false)) return;
+                                param.args[3] = Boolean.TRUE; // 13 STOP -> 11 KILL_OR_STOP
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("HOOK OK KillAppWrapper#forceStopAppList (recents swipe up kill)");
+        } catch (Throwable t) {
+            log("HOOK FAIL KillAppWrapper#forceStopAppList :: " + Log.getStackTraceString(t));
+        }
+    }
+
+    // RecentsView 里该包还剩下几张卡片(getTaskViewCount/getTaskViewAt 均为 OplusRecentsViewImpl
+    // 的公开方法, 已 dexdump 核对)。
+    private static int countTaskViewsOfPkg(Object recentsView, String pkg) {
+        int count = 0;
+        try {
+            int n = (Integer) XposedHelpers.callMethod(recentsView, "getTaskViewCount");
+            for (int i = 0; i < n; i++) {
+                Object tv = XposedHelpers.callMethod(recentsView, "getTaskViewAt", i);
+                if (tv == null) continue;
+                Object task = XposedHelpers.callMethod(tv, "getTask");
+                if (task == null) continue;
+                Object key = XposedHelpers.getObjectField(task, "key");
+                if (key == null) continue;
+                if (pkg.equals(XposedHelpers.callMethod(key, "getPackageName"))) count++;
+            }
+        } catch (Throwable ignored) { }
+        return count;
+    }
+
+    // 收集 RecentsView 里该包其它任务(排除 excludeId)的任务 id。
+    private static void collectTaskIdsOfPkg(Object recentsView, String pkg,
+            java.util.List<Integer> out, int excludeId) {
+        try {
+            int n = (Integer) XposedHelpers.callMethod(recentsView, "getTaskViewCount");
+            for (int i = 0; i < n; i++) {
+                Object tv = XposedHelpers.callMethod(recentsView, "getTaskViewAt", i);
+                if (tv == null) continue;
+                Object task = XposedHelpers.callMethod(tv, "getTask");
+                if (task == null) continue;
+                Object key = XposedHelpers.getObjectField(task, "key");
+                if (key == null) continue;
+                if (!pkg.equals(XposedHelpers.callMethod(key, "getPackageName"))) continue;
+                int id = (Integer) XposedHelpers.getObjectField(key, "id");
+                if (id != excludeId) out.add(id);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    // 该任务是不是主任务: 任务的根组件是否属于该包的 launcher 入口。
+    // 用 LauncherApps.getActivityList() 拿该包全部入口(alias 也在内), 所以 splash/alias 启动的
+    // 应用其主任务仍判为主任务; 而小程序这类任务的根组件不在入口列表里 -> 判为附属。
+    // 与系统 OplusTaskUtils#getTitle 的比对方式一致: key.baseIntent.getComponent()。
+    // 返回 null 表示判定不了(此时调用方会退回保守逻辑, 不做附属清理)。
+    private static Boolean isMainTask(Context ctx, Object key) {
+        try {
+            String pkg = (String) XposedHelpers.callMethod(key, "getPackageName");
+            if (pkg == null) return null;
+            android.content.ComponentName base = null;
+            try {
+                Object baseIntent = XposedHelpers.getObjectField(key, "baseIntent");
+                base = (android.content.ComponentName) XposedHelpers.callMethod(
+                        baseIntent, "getComponent");
+            } catch (Throwable ignored) { }
+            if (base == null) {
+                base = (android.content.ComponentName) XposedHelpers.callMethod(
+                        key, "getComponent");
+            }
+            if (base == null) return null;
+            android.content.pm.LauncherApps la =
+                    (android.content.pm.LauncherApps) ctx.getSystemService(
+                            Context.LAUNCHER_APPS_SERVICE);
+            if (la == null) return null;
+            java.util.List<android.content.pm.LauncherActivityInfo> list =
+                    la.getActivityList(pkg, android.os.Process.myUserHandle());
+            if (list == null || list.isEmpty()) return null;
+            for (android.content.pm.LauncherActivityInfo info : list) {
+                if (base.equals(info.getComponentName())) return Boolean.TRUE;
+            }
+            return Boolean.FALSE;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    // 卡片是否被锁定(锁定的卡片上划不掉、清除全部时也会保留)。复用系统自己的判定,
+    // 与 createAllTasksDismissAnimation 决定是否给它消失动画用的是同一个方法。
+    private static boolean isLockedTaskView(Object taskView,
+            XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            Class<?> util = XposedHelpers.findClass(
+                    "com.oplus.quickstep.utils.RecentsViewAnimUtil", lpparam.classLoader);
+            Object inst = XposedHelpers.getStaticObjectField(util, "INSTANCE");
+            Object r = XposedHelpers.callMethod(inst, "isLockedOrSupportQuickStartup", taskView);
+            return r instanceof Boolean && (Boolean) r;
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    // 请求彻底结束进程。Launcher 是普通应用, 没有 FORCE_STOP_PACKAGES, 反射调
+    // ActivityManager#forceStopPackage 必被 SecurityException 拒(KernelSU 也不给 app root),
+    // 所以借道 ActivityManager#killBackgroundProcesses 把包名送进 system_server ——
+    // 那边的 hook 会拦下这次调用并升级成 AMS#forceStopPackage(见 SystemServerHooks)。
+    private static void requestForceStop(Context ctx, String pkg) {
+        if (ctx == null || pkg == null) return;
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) am.killBackgroundProcesses(pkg);
+        } catch (Throwable ignored) { }
+    }
+
+    // 定向杀掉某个任务所在的进程(用于划掉小程序: 只关这一个, 不能整包强杀)。
+    // 与 requestForceStop 走同一个通道, 用 "cmtask:<taskId>" 前缀区分; 两端都是本模块的 hook,
+    // 且 system_server 侧会 setResult 跳掉原方法, 不会真的去杀这个"不存在的包名"。
+    private static void requestKillTask(Context ctx, int taskId) {
+        if (ctx == null) return;
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) am.killBackgroundProcesses("cmtask:" + taskId);
+        } catch (Throwable ignored) { }
     }
 
     // 复刻系统 TaskUtils.isFlexibleFloatingWindow(TaskInfo): 判断任务是否处于小窗/自由窗口状态。

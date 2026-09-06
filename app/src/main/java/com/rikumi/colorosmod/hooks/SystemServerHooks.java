@@ -1173,4 +1173,139 @@ public final class SystemServerHooks {
             }
         }
     }
+
+    // ---- 多任务清除卡片时彻底结束进程 (与 LauncherHooks#hookRecentsSwipeUpKill 配合) ----
+    // Launcher 是普通应用: 没有 FORCE_STOP_PACKAGES(反射调 ActivityManager#forceStopPackage
+    // 必被 SecurityException 拒), KernelSU 也不给 app root, 所以它无法自己强杀。
+    // 通道: Launcher 调 ActivityManager#killBackgroundProcesses(pkg) 把包名送进来, 这里拦下
+    // (setResult 跳过原方法, 顺带绕开 KILL_BACKGROUND_PROCESSES 权限检查 —— Launcher 没声明它),
+    // 再以 system_server 的身份升级成 AMS#forceStopPackage, 彻底结束进程。
+    // 必须在 mGlobalLock 之外执行, 所以另起线程 + clearCallingIdentity。
+    private static volatile int sLauncherUid = -1;
+
+    public static void hookRecentsSwipeUpKillSystemServer(
+            final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            final Class<?> amsCls = XposedHelpers.findClass(
+                    "com.android.server.am.ActivityManagerService", lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(amsCls, "killBackgroundProcesses",
+                    String.class, int.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                // 两个开关任一打开都要放行: 清附属任务是独立开关,
+                                // 它不依赖"多任务上划彻底结束进程"。
+                                if (!readBool(KEY_RECENTS_SWIPE_UP_KILL_ENABLED, false)
+                                        && !readBool(
+                                                KEY_RECENTS_SWIPE_UP_KILL_SUBSIDIARY_ENABLED,
+                                                false)) {
+                                    return;
+                                }
+                                final int uid = android.os.Binder.getCallingUid();
+                                if (uid == android.os.Process.myUid()) return;
+                                if (sLauncherUid < 0) {
+                                    Context ctx = (Context) XposedHelpers.getObjectField(
+                                            param.thisObject, "mContext");
+                                    if (ctx == null) return;
+                                    sLauncherUid = ctx.getPackageManager()
+                                            .getPackageUid("com.android.launcher", 0);
+                                }
+                                if (uid != sLauncherUid) return;
+                                final String arg = (String) param.args[0];
+                                if (arg == null || arg.isEmpty()) return;
+                                param.setResult(null); // 跳过原方法, 不做"只杀后台"的弱处理
+                                final Object ams = param.thisObject;
+                                // "cmtask:<taskId>": 定向杀掉某个任务所在的进程, 用于划掉小程序。
+                                if (arg.startsWith("cmtask:")) {
+                                    final int taskId;
+                                    try {
+                                        taskId = Integer.parseInt(arg.substring(7));
+                                    } catch (Throwable e) {
+                                        return;
+                                    }
+                                    new Thread(new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            try {
+                                                Thread.sleep(300L);
+                                            } catch (Throwable ignored) { }
+                                            long id = android.os.Binder.clearCallingIdentity();
+                                            try {
+                                                killTaskProcess(ams, taskId);
+                                            } finally {
+                                                android.os.Binder.restoreCallingIdentity(id);
+                                            }
+                                        }
+                                    }).start();
+                                    return;
+                                }
+                                final String pkg = arg;
+                                // 用调用方自身的用户 id, 避免 Launcher 传进来的可能是 USER_CURRENT。
+                                final int userId = uid / 100000;
+                                new Thread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try {
+                                            // 等卡片移除/任务清理跑完再强杀, 否则可能撞上收尾流程。
+                                            Thread.sleep(300L);
+                                        } catch (Throwable ignored) { }
+                                        long ident = android.os.Binder.clearCallingIdentity();
+                                        try {
+                                            XposedHelpers.callMethod(
+                                                    ams, "forceStopPackage", pkg, userId);
+                                        } catch (Throwable t) {
+                                            log("!!! recents_swipe_up_kill forceStopPackage "
+                                                    + pkg + " failed: " + t);
+                                        } finally {
+                                            android.os.Binder.restoreCallingIdentity(ident);
+                                        }
+                                    }
+                                }).start();
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+            log("HOOK OK ActivityManagerService#killBackgroundProcesses (recents swipe up kill)");
+        } catch (Throwable t) {
+            log("HOOK FAIL ActivityManagerService#killBackgroundProcesses "
+                    + "(recents swipe up kill) :: " + Log.getStackTraceString(t));
+        }
+    }
+
+    // 杀掉某个任务所在的进程(不整包强杀)。ATMS 经 AMS.mAtmInternal 的 this$0 拿到。
+    private static void killTaskProcess(Object ams, int taskId) {
+        try {
+            Object atmInternal = XposedHelpers.getObjectField(ams, "mAtmInternal");
+            Object atms = XposedHelpers.getObjectField(atmInternal, "this$0");
+            Object root = XposedHelpers.getObjectField(atms, "mRootWindowContainer");
+            Object task = XposedHelpers.callMethod(root, "anyTaskForId", taskId, 1);
+            if (task == null) return;
+            java.util.Set<Integer> pids = new java.util.HashSet<>();
+            // Task.mRootProcess 是该任务的宿主进程
+            Object proc = XposedHelpers.getObjectField(task, "mRootProcess");
+            addPid(pids, proc);
+            // 兜底: 顶部 Activity 的宿主进程
+            Object top = XposedHelpers.callMethod(task, "getTopNonFinishingActivity");
+            if (top != null) {
+                try {
+                    addPid(pids, XposedHelpers.getObjectField(top, "app"));
+                } catch (Throwable ignored) { }
+            }
+            for (Integer pid : pids) {
+                if (pid != null && pid > 0 && pid != android.os.Process.myPid()) {
+                    android.os.Process.killProcess(pid);
+                }
+            }
+        } catch (Throwable t) {
+            log("!!! recents_swipe_up_kill killTaskProcess " + taskId + " failed: " + t);
+        }
+    }
+
+    private static void addPid(java.util.Set<Integer> pids, Object windowProcessController) {
+        if (windowProcessController == null) return;
+        try {
+            Object r = XposedHelpers.callMethod(windowProcessController, "getPid");
+            if (r instanceof Integer) pids.add((Integer) r);
+        } catch (Throwable ignored) { }
+    }
 }

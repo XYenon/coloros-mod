@@ -127,6 +127,9 @@
 | 导航与手势 | 禁止手势条动画效果 | `gesture_bar_long_press_disable_enabled` | — |
 | 导航与手势 | 启用 mBack | `mback_enabled` | — |
 | 导航与手势 | 避免手势区域点击穿透 | `gesture_touch_through_enabled` | — |
+| 导航与手势 | 多任务上划彻底结束进程 | `recents_swipe_up_kill_enabled` | — |
+| 多任务 | 隐藏未在运行的应用 | `recents_hide_not_running_enabled` | — |
+| 多任务 | 划掉主任务时一并清空附属任务 | `recents_swipe_up_kill_subsidiary_enabled` | — |
 | 导航与手势 | 恢复原生旋转按钮位置 | `rotation_button_fixed_position_enabled` | — |
 
 未在设置界面暴露、仅存于 prefs 的键：
@@ -599,6 +602,78 @@ COUI 给锁屏密码控件叠了三类非纯色绘制，分别跳过，去掉后
 - hook `com.oplus.quickstep.data.OplusRecentTasksFilter#filterTaskInfo(int, int, GroupedTaskInfo, ArrayList)`，
   before 里 `getTaskInfo1()` 后用 `TaskUtils.isFlexibleFloatingWindow(TaskInfo)` 判定（兜底 `windowingMode == 5`），
   为真则 `setResult(true)` 剔除卡片。应用本身仍在前台运行。
+
+**多任务上划彻底结束进程** `recents_swipe_up_kill_enabled`
+
+- 上划卡片链路（网格/栈/堆叠三种布局统一，均已 dexdump 核对）：
+  `TaskViewTouchController#reInitAnimationController(true)` 建 dismiss 动画
+  → `OplusRecentsViewImpl#createTaskDismissAnimation`（栈布局走 `#createTaskDismissAnimationAsStack`）
+  → delegate（`OplusRecentsViewDelegate` / `StackRecentsViewDelegate`…）→ `RecentsViewAnimUtil`
+  的 dismiss 动画结束监听 → `handleSuccessfulDismiss` → `createTaskRemovalRunnable#run`
+  → `OplusRecentsViewImpl#removeTask(TaskView)` → `KillAppWrapper.forceStopTasks(ctx, task)`。
+- 唯一收口是 `com.oplus.quickstep.memory.KillAppWrapper#forceStopAppList(Context, ArrayList, String, boolean)`
+  （classes3.dex，PRIVATE STATIC，签名已 dexdump 核对）。末位 boolean 决定下发类型：
+  `false → type=13 (REQUEST_TYPE_STOP)`、`true → type=11 (REQUEST_TYPE_KILL_OR_STOP)`；
+  两条下发路径（`newApiSupport()` 为真走 Osense `requestSceneAction`，否则 `startService` 给 `com.oplus.athena`）都读它。
+  系统默认是 `false`，所以上划只"停任务"、进程还在 —— 本功能就是把该位置成 `true`。
+- 陷阱：`forceStopTasks` 内部是 `OplusExecutors.getURGENT_TRANSACTION_EXECUTOR().submit(...)` 异步执行，
+  **ThreadLocal 与调用栈都跨不过线程**，无法在 `removeTask` 打标记再在 `forceStopAppList` 里认，
+  只能在 `forceStopAppList` 上直接改入参（影响面：所有 `forceStopTasks` 调用，即移除任务卡片与多实例清理，
+  都属"结束任务"，可接受）。
+- 不要 hook `RecentsView#removeTaskInternal(int)`：那是 AOSP 基类的 dismiss end 回调，
+  `OplusRecentsViewImpl` 已覆盖 `createTaskDismissAnimation`，实际不走它。
+- 彻底杀进程只能走 system_server：Launcher 是普通应用，没有 `FORCE_STOP_PACKAGES`
+  （signature|privileged，dumpsys 确认只有 REMOVE_TASKS granted，装不了 FORCE_STOP_PACKAGES），
+  反射 `ActivityManager#forceStopPackage` 必被 SecurityException 拒。设备是 KernelSU
+  （`u:r:ksu:s0`、`/data/adb/ksu`），**KSU 默认不给 app root**，Launcher 里 exec `su` 直接被拒，
+  所以 root 兜底也走不通（表现为 `pidof` 空 = no-pid）。最终方案：Launcher 侧补调 removeTask，
+  system_server 侧 `SystemServerHooks#hookRecentsSwipeUpKillSystemServer` 收到后
+  `Binder.clearCallingIdentity()` + `AMS#forceStopPackage(pkg, userId)`（另起线程 + 延迟 300ms，
+  绝不能在 mGlobalLock 内调）。
+- system_server 侧要点：`com.android.server.wm.ActivityTaskManagerService#removeTask(int)`
+  （public boolean，先 `enforceCallingPermission(REMOVE_TASKS)`）；`ATMS.mContext` 取 PM 查
+  Launcher uid 做调用方过滤（避免别处 removeTask 被顺带强杀）；`mRootWindowContainer
+  .anyTaskForId(taskId, 1)` 取 Task，`Task#getBasePackageName()` 包名、`Task#mUserId` 用户；
+  AMS 实例 = `ATMS.mAmInternal`（AMS 非静态内部类 `LocalService`）的 `this$0`。
+- 后来重构：不再从 removeTask 反查包名，改由 Launcher 主动调
+  `ActivityManager#killBackgroundProcesses(pkg)` 把包名送进来，system_server 侧 hook
+  `AMS#killBackgroundProcesses(String,int)V`（services.jar classes.dex，PUBLIC，已 dexdump
+  核对），确认 `Binder.getCallingUid()` 是 Launcher 的 uid 后 `setResult(null)` 跳过原方法
+  （顺带绕开 Launcher 未声明的 KILL_BACKGROUND_PROCESSES 权限），再 `clearCallingIdentity()`
+  + `AMS#forceStopPackage(pkg, userId)`（另起线程 + 延迟 300ms，绝不能在 mGlobalLock 内调）。
+  这样包名由 Launcher 明确给出，不依赖任务是否还在（清除全部时任务已没了）。
+- 微信小程序任务判定：系统常量 `OplusTaskUtils.WECHAT_APPLETS_CLASS_NAME =
+  "plugin.appbrand.ui.AppBrandUI"`（Kotlin object，`INSTANCE.isUseMultiAppletsTitle(Task)`）；
+  口径是 `task.getTopComponent().getClassName()` **包含**该串（AppBrandUI1/2/3 都算）。
+  小程序是 com.tencent.mm 下的独立任务（独立 :appbrand* 进程），与微信主窗同包不同任务。
+- **通用化（最终方案，已废弃微信专用开关）**：不硬编码任何应用，用「主任务/附属任务」判定。
+  判据：任务的根组件 `TaskKey.baseIntent.getComponent()`（兜底 `key.getComponent()`，
+  即 `origActivity ?: realActivity`） vs `LauncherApps.getActivityList(pkg, myUserHandle())`
+  返回的该包**全部** launcher 入口（alias 也在内）。命中=主任务，未命中=附属任务。
+  与系统 `OplusTaskUtils#getTitle`（155-163 行）的比对方式一致。
+  **关键**：不能用 `PackageManager.getLaunchIntentForPackage()`，它只返回一个组件，
+  splash/alias 启动的应用（如 QQ 的 `SplashActivity`）会被误判成附属任务。
+  判定不了返回 null → 退回保守逻辑（不做附属清理），绝不误删其它卡片。
+- 已排除的错误思路：`OplusBaseTask#isSecondaryTask` 是**分屏的右/下半屏**
+  （见 `OplusRecentTasksMapper` 赋值），不是附属任务。系统里没有通用的"小程序"概念，
+  `applets` 只有微信常量；小程序圆形图标在 Launcher 里找不到特殊渲染逻辑
+  （`OplusTaskHeaderView`/`OplusTaskHeaderIconLayout` 搜 circle/round/OvalShape 全 0），
+  不能作为判据。
+- 三种划法：主任务有附属 → 移除自己 + 收集同包其余 taskId 一并 `removeTask` + **整包 force-stop
+  （不再额外要求"彻底结束进程"开关，本开关语义就是 kill+移除）**；附属任务 → 只移除自己 +
+  定向杀自己进程（需 kill 开关）；主任务无附属 / 判定不了 → 同包无其它卡片才整包强杀（需 kill 开关）。
+- 陷阱（已踩）：通用化时把 key 从 `..._wechat_applets_enabled` 换成 `..._subsidiary_enabled`，
+  旧开关值不会迁移，用户侧表现为"功能突然失效"。查开关状态用只读
+  `adb shell content query --uri content://com.rikumi.colorosmod.settings/<key>`（返回 `v=1`/无结果）。
+- 划掉小程序本身：只定向杀该任务所在进程（`cmtask:<taskId>` 通道 → `AMS#killTaskProcess`：
+  `AMS.mAtmInternal.this$0` = ATMS → `mRootWindowContainer.anyTaskForId(id, 1)` →
+  `Task.mRootProcess`(或 `getTopNonFinishingActivity().app`) 是 WindowProcessController，
+  `getPid()` 后 `Process.killProcess`)。**绝不能整包 force-stop**，否则微信主进程一起没。
+- 陷阱（已踩）：`OplusRecentsViewImpl#removeTask` 的 after 里补调 `removeTask` 让卡片消失这一步，
+  不能挂在"待杀包名非空"之后——划小程序时同包卡片数 >1、包名标记为空，会导致连任务都不移除，
+  "小程序划不掉"。卡片移除必须无条件做（只要任一开关打开），杀进程才是条件分支。
+- 改动落在 android 作用域，**需 `setprop ctl.restart zygote`（须先征询用户同意）** 才生效。
+- 改动只在 `com.android.launcher` 作用域，重载 Launcher（`pkill -f com.android.launcher`）即可生效。
 
 **桌面双指张开打开隐藏应用** `pinch_out_open_hide_apps_enabled`
 

@@ -146,7 +146,7 @@ internal data class SelectItem(
 private val DESKTOP: List<SettingsItem> = listOf(
     GroupTitleItem("桌面布局"),
     SwitchItem("icon_gap_enabled", "增加图标与名称间距", sliderKey = "icon_gap_dp", sliderMax = 8, sliderDefault = 4),
-    SwitchItem("drawer_columns_enabled", "调整抽屉每行图标数量", sliderKey = "drawer_columns", sliderMax = 6, sliderDefault = 5, sliderUnit = "个", sliderMin = 4),
+    SwitchItem("drawer_columns_enabled", "强制抽屉每行图标数量（实验性）", sliderKey = "drawer_columns", sliderMax = 6, sliderDefault = 5, sliderMin = 4),
     SwitchItem("drawer_letter_scroll_enabled", "字母索引滚动定位", "点右侧字母条滚动到对应位置，而不是弹出图标"),
     SwitchItem("indicator_enabled", "减小页面与 Dock 间距", sliderKey = "indicator_dp", sliderMax = 32, sliderDefault = 16, sliderUnit = "dp"),
     SwitchItem("edit_mode_bg_transparent_enabled", "取消编辑模式背景遮罩"),
@@ -216,6 +216,10 @@ private val NAV: List<SettingsItem> = listOf(
     GroupTitleItem("手势视觉"),
     SwitchItem("gesture_bar_width_enabled", "调整手势滑动条宽度", sliderKey = "gesture_bar_width_dp", sliderMax = 120, sliderDefault = 100, sliderUnit = "dp", sliderMin = 80),
     SwitchItem("gesture_bar_long_press_disable_enabled", "禁止手势条动画效果", "理论可解决 OxygenOS 关不掉助手动画的问题"),
+    GroupTitleItem("多任务切换"),
+    SwitchItem("recents_hide_not_running_enabled", "多任务隐藏未在运行的应用"),
+    SwitchItem("recents_swipe_up_kill_enabled", "多任务上划彻底结束进程", "修改该设置需重启 Zygote 生效"),
+    SwitchItem("recents_swipe_up_kill_subsidiary_enabled", "划掉同应用主任务一并结束附属任务", "如划掉微信将带走所有小程序，否则需手动划掉所有小程序"),
 )
 
 private val LOCKSCREEN: List<SettingsItem> = listOf(

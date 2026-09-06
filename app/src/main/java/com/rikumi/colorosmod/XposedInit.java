@@ -203,6 +203,19 @@ public class XposedInit extends XposedModule {
             "gesture_touch_through_enabled";
     public static final String KEY_GESTURE_BAR_LONG_PRESS_DISABLE_ENABLED =
             "gesture_bar_long_press_disable_enabled";
+    // 多任务上划彻底结束进程: 上划卡片时系统只以 type=13(STOP) 请求 athena 停止任务,
+    // 开启后改成 type=11(KILL_OR_STOP) 真正杀掉进程(见 LauncherHooks#hookRecentsSwipeUpKill)。
+    public static final String KEY_RECENTS_SWIPE_UP_KILL_ENABLED = "recents_swipe_up_kill_enabled";
+    // 多任务隐藏未在运行的应用: 只保留还在运行的任务卡片。判据是 android.app.TaskInfo#isRunning
+    // (PUBLIC boolean, system_server 侧 Task#fillTaskInfo 里 info.isRunning = (top != null),
+    //  即任务是否还有存活的 Activity), 见 LauncherHooks#hookRecentsHideNotRunning。
+    public static final String KEY_RECENTS_HIDE_NOT_RUNNING_ENABLED =
+            "recents_hide_not_running_enabled";
+    // 划掉主任务时一并清空附属任务: 附属任务(如微信小程序)是同包下的另一个独立任务
+    // (独立进程), 划掉主任务不会带走它们; 开启后连同任务一起移除并强杀。
+    // 主/附属用该包全部 launcher 入口判定, 不硬编码任何应用(见 LauncherHooks#isMainTask)。
+    public static final String KEY_RECENTS_SWIPE_UP_KILL_SUBSIDIARY_ENABLED =
+            "recents_swipe_up_kill_subsidiary_enabled";
     // 从桌面隐藏指定的单个 LAUNCHER 活动: 系统"隐藏应用"按包隐藏会误伤多入口应用(如电话本+拨号),
     // 故只过滤目标组件。配置表见 HIDDEN_LAUNCHER_TARGETS: { 门控偏好键, 包名, 活动类名 }。
     public static final String KEY_HIDE_CONTACTS_ENABLED = "hide_contacts_enabled";
@@ -478,6 +491,8 @@ public class XposedInit extends XposedModule {
             SystemServerHooks.hookFloatWindowLandscapeKeepRatio(lpparam);
             // system_server: 小窗缩到最小贴边不留边距 + 最大可调宽度 = 屏幕宽度
             SystemServerHooks.hookFloatWindowSizeLimits(lpparam);
+            // system_server: 多任务上划彻底结束进程, 配合 LauncherHooks 的 removeTask 补调
+            SystemServerHooks.hookRecentsSwipeUpKillSystemServer(lpparam);
         }
         // 状态栏歌词只需在 SystemUI 侧实现: 直接读 MediaSession 的标题,
         // 无需在音乐软件进程注入, 也无需伪装机型(见 StatusBarLyricHooks 类注释)。
