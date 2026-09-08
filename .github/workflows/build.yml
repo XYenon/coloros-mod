@@ -41,6 +41,7 @@ jobs:
             VERSION="${MAJOR}.${MINOR}.${PATCH}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$LATEST" >> "$GITHUB_OUTPUT"
           echo "Next version: $VERSION (from $LATEST)"
 
       # 同步写入 app/build.gradle 的 versionCode / versionName
@@ -68,6 +69,24 @@ jobs:
           git tag "v${{ steps.version.outputs.version }}"
           git push origin "v${{ steps.version.outputs.version }}"
 
+      - name: Generate release changelog
+        id: changelog
+        env:
+          PREVIOUS_TAG: ${{ steps.version.outputs.previous_tag }}
+        run: |
+          if [ -n "$PREVIOUS_TAG" ]; then
+            RANGE="${PREVIOUS_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+          {
+            echo 'body<<CHANGELOG_EOF'
+            git log "$RANGE" --pretty=format:'- %s (%h)' \
+              --invert-grep --grep='^chore: bump version to '
+            echo
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
@@ -79,7 +98,7 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.body }}
           files: app/build/outputs/apk/debug/*.apk
 
       # 同步 README 与 release 到 Xposed-Modules-Repo 镜像仓库
@@ -118,5 +137,5 @@ jobs:
           token: ${{ secrets.XPOSED_REPO_TOKEN }}
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.body }}
           files: app/build/outputs/apk/debug/*.apk
