@@ -14,6 +14,7 @@ import android.widget.TextSwitcher;
 
 import com.rikumi.colorosmod.hooks.GestureHooks;
 import com.rikumi.colorosmod.hooks.LauncherHooks;
+import com.rikumi.colorosmod.hooks.MediaProviderHooks;
 import com.rikumi.colorosmod.hooks.SafecenterHooks;
 import com.rikumi.colorosmod.hooks.SettingsHooks;
 import com.rikumi.colorosmod.hooks.StatusBarLyricHooks;
@@ -484,6 +485,8 @@ public class XposedInit extends XposedModule {
             SafecenterHooks.hookSafecenter(lpparam);
         } else if ("com.android.settings".equals(lpparam.packageName)) {
             SettingsHooks.hookSettings(lpparam);
+        } else if ("com.android.providers.media.module".equals(lpparam.packageName)) {
+            MediaProviderHooks.hookMediaProvider(lpparam);
         } else if ("android".equals(lpparam.packageName)) {
             // system_server: 承载"贴边最小化"的真正提交逻辑(com.android.server.wm.FlexibleTaskController)
             SystemServerHooks.hookFloatWindowEdgeHangSystemServer(lpparam);

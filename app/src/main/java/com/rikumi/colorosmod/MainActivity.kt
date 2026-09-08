@@ -55,6 +55,7 @@ import top.yukonga.miuix.kmp.icon.extended.Blocklist
 import top.yukonga.miuix.kmp.icon.extended.Community
 import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.icon.extended.GridView
+import top.yukonga.miuix.kmp.icon.extended.Folder
 import top.yukonga.miuix.kmp.icon.extended.Hide
 import top.yukonga.miuix.kmp.icon.extended.Lock
 import top.yukonga.miuix.kmp.icon.extended.Refresh
@@ -131,6 +132,14 @@ internal data class SwitchItem(
     val sliderMin: Int = 0,
 ) : SettingsItem
 
+// MediaProvider 默认目录屏蔽项。它不参与分类/全局主开关，只保存用户选择；开启时仅尝试
+// 删除同名空目录，目录非空则保持原样。
+internal data class FolderBlockItem(
+    val key: String,
+    val label: String,
+    val folderName: String,
+) : SettingsItem
+
 // 下拉选项设置项。options 为静态选项; dynamicOptions 非空时进入页面后于 IO 线程重拉(如"新应用添加到"
 // 需读桌面文件夹名), 失败则沿用 options。valueKey 非空时选中项除存下标外还把选项文本写到 valueKey ——
 // 选项会随桌面文件夹增删变化, 只存下标会在删文件夹后错位, 存文本则能自然回落到第 0 项。
@@ -141,7 +150,7 @@ internal data class SelectItem(
     val defaultValue: Int = 0,
     val valueKey: String? = null,
     val dynamicOptions: ((Context) -> List<String>)? = null,
-)
+) : SettingsItem
 
 private val DESKTOP: List<SettingsItem> = listOf(
     GroupTitleItem("桌面布局"),
@@ -234,6 +243,17 @@ private val LOCKSCREEN: List<SettingsItem> = listOf(
     SwitchItem("keyguard_no_charge_anim_enabled", "取消锁屏充电动画"),
 )
 
+private val STORAGE: List<SettingsItem> = listOf(
+    GroupTitleItem("不自动创建以下文件夹"),
+    FolderBlockItem("media_folder_block_alarms", "Alarms", "Alarms"),
+    FolderBlockItem("media_folder_block_audiobooks", "Audiobooks", "Audiobooks"),
+    FolderBlockItem("media_folder_block_movies", "Movies", "Movies"),
+    FolderBlockItem("media_folder_block_notifications", "Notifications", "Notifications"),
+    FolderBlockItem("media_folder_block_podcasts", "Podcasts", "Podcasts"),
+    FolderBlockItem("media_folder_block_recordings", "Recordings", "Recordings"),
+    FolderBlockItem("media_folder_block_ringtones", "Ringtones", "Ringtones"),
+)
+
 // 首页的一个分类入口: id 用于页面栈定位, title 为首页/子页面标题, icon 取 miuix 扩展图标。
 // subtitle 配置后显示在首页入口行右侧(不单独占第二行); hint 作为该分类子页面 group 的 header 说明。
 private data class Category(
@@ -259,6 +279,7 @@ private val CATEGORY_GROUPS: List<List<Category>> = listOf(
         Category("navigation", "导航与手势", MiuixIcons.Backup, NAV),
     ),
     listOf(
+        Category("storage", "存储管理", MiuixIcons.Folder, STORAGE),
         Category(DISABLED_APPS_ID, "停用应用", MiuixIcons.Blocklist, emptyList()),
     ),
 )
@@ -276,10 +297,22 @@ private fun MasterOverride?.valueFor(scope: String?): Boolean? =
     this?.takeIf { it.scope == null || it.scope == scope }?.value
 
 // 设置分组: desc 为分组小标题(空字符串仅分隔不显示标题), items 为该组全部设置项。
-private data class SwitchGroup(val desc: String?, val items: List<SwitchItem>)
+private data class SwitchGroup(val desc: String?, val items: List<SettingsItem>)
 
 // 过滤出实际设置项(GroupTitleItem 只是分组标题, 无 key 不参与开关)。
 private val List<SettingsItem>.switches: List<SwitchItem> get() = filterIsInstance<SwitchItem>()
+
+// 分类/全局顶部“一键启用”所管理的项目；目录屏蔽项也属于可启用功能。
+private val List<SettingsItem>.masterItems: List<SettingsItem>
+    get() = filter { it is SwitchItem || it is FolderBlockItem }
+
+private val SettingsItem.settingKey: String
+    get() = when (this) {
+        is SwitchItem -> key
+        is FolderBlockItem -> key
+        is SelectItem -> key
+        is GroupTitleItem -> ""
+    }
 
 // 按 GroupTitleItem 把条目切成连续的若干段, 每段渲染为一张独立卡片。
 // GroupTitleItem 可放在其它 item 之间或首个 item 前面; 连续多个时以后一个为准, 不会产生空段。
@@ -287,7 +320,7 @@ private fun List<SettingsItem>.splitByDivider(): List<SwitchGroup> {
     if (isEmpty()) return emptyList()
     val result = mutableListOf<SwitchGroup>()
     var desc: String? = null
-    var current = mutableListOf<SwitchItem>()
+    var current = mutableListOf<SettingsItem>()
     forEach { item ->
         when (item) {
             is GroupTitleItem -> {
@@ -296,6 +329,8 @@ private fun List<SettingsItem>.splitByDivider(): List<SwitchGroup> {
                 current = mutableListOf()
             }
             is SwitchItem -> current.add(item)
+            is FolderBlockItem -> current.add(item)
+            is SelectItem -> current.add(item)
         }
     }
     if (current.isNotEmpty()) result.add(SwitchGroup(desc, current))
@@ -340,17 +375,27 @@ fun SettingsScreen() {
 
     // 主开关: scope = null 作用于全部功能(首页), 否则只作用于该分类的设置项。
     val onMasterChange: (String?, Boolean) -> Unit = { targetScope, target ->
-        val items = targetScope?.let { id -> CATEGORIES.first { it.id == id }.items.switches }
-            ?: CATEGORIES.flatMap { it.items.switches }
+        val items = targetScope?.let { id -> CATEGORIES.first { it.id == id }.items.masterItems }
+            ?: CATEGORIES.flatMap { it.items.masterItems }
         masterOverride = MasterOverride(targetScope, target)
         version++
         scope.launch {
             delay(MASTER_TOGGLE_ANIM_MS)
             // 动画结束后再真正写入设置; IO 线程执行, 避免阻塞 UI。
-            withContext(Dispatchers.IO) {
-                items.forEach { item ->
-                    setBool(ctx, item.key, target)
-                    if (!target) item.sliderKey?.let { setInt(ctx, it, item.sliderDefault) }
+                withContext(Dispatchers.IO) {
+                    items.forEach { item ->
+                    when (item) {
+                        is SwitchItem -> {
+                            setBool(ctx, item.key, target)
+                            if (!target) item.sliderKey?.let { setInt(ctx, it, item.sliderDefault) }
+                        }
+                        is FolderBlockItem -> {
+                            setBool(ctx, item.key, target)
+                            if (target) deleteEmptyMediaFolder(item.folderName)
+                            else createMediaFolder(item.folderName)
+                        }
+                        else -> Unit
+                    }
                 }
             }
             // 清除临时覆盖, 各开关回到以 prefs 为准(此时已与 target 一致, 无跳变)。
@@ -383,7 +428,7 @@ fun SettingsScreen() {
             DisabledAppsScreen(ctx = ctx, onBack = { openCategoryId = null })
         } else if (category == null) {
             val anyEnabled = remember(version) {
-                CATEGORIES.any { c -> c.items.switches.any { prefs.getBoolean(it.key, false) } }
+                CATEGORIES.any { c -> c.items.masterItems.any { prefs.getBoolean(it.settingKey, false) } }
             }
             HomeScreen(
                 masterChecked = masterOverride.valueFor(null) ?: anyEnabled,
@@ -392,7 +437,7 @@ fun SettingsScreen() {
             )
         } else {
             val override = masterOverride.valueFor(category.id)
-            val anyEnabled = remember(version) { category.items.switches.any { prefs.getBoolean(it.key, false) } }
+            val anyEnabled = remember(version) { category.items.masterItems.any { prefs.getBoolean(it.settingKey, false) } }
             CategoryScreen(
                 category = category,
                 prefs = prefs,
@@ -544,11 +589,13 @@ private fun CategoryScreen(
         ) {
             // 第一个 group 的 header: 说明滑块两端值的含义。
             item { CouixSmallTitle(text = SLIDER_GROUP_HINT) }
-            item {
-                CategoryMasterToggle(
-                    checked = masterChecked,
-                    onCheckedChange = onMasterChange,
-                )
+            if (category.items.masterItems.isNotEmpty()) {
+                item {
+                    CategoryMasterToggle(
+                        checked = masterChecked,
+                        onCheckedChange = onMasterChange,
+                    )
+                }
             }
             // 该分类专属说明: 作为设置项 group 的 header 显示(仅配置了 hint 的分类)。
             val hint = category.hint
@@ -807,6 +854,31 @@ internal fun setBool(ctx: Context, key: String, value: Boolean) {
 
 internal fun setInt(ctx: Context, key: String, value: Int) {
     ctx.settingsPrefs().edit().putInt(key, value).commit()
+}
+
+// 只删除指定的标准一级目录，并使用 rmdir 保证目录非空时绝不删除任何内容。
+internal fun deleteEmptyMediaFolder(folderName: String) {
+    if (folderName !in setOf(
+            "Music", "Podcasts", "Ringtones", "Alarms", "Notifications",
+            "Movies", "Audiobooks", "Recordings",
+        )
+    ) return
+    // /storage/emulated/0 经过 MediaProvider/FUSE，root shell 也可能被拒绝删除顶层目录；
+    // /data/media/0 是同一共享存储的底层路径。两次都只调用 rmdir，非空时均不会删除。
+    runRoot("rmdir /data/media/0/$folderName 2>/dev/null; " +
+            "rmdir /storage/emulated/0/$folderName 2>/dev/null")
+}
+
+internal fun createMediaFolder(folderName: String) {
+    if (folderName !in setOf(
+            "Music", "Podcasts", "Ringtones", "Alarms", "Notifications",
+            "Movies", "Audiobooks", "Recordings",
+        )
+    ) return
+    // MediaProvider 默认目录由 media_rw(1023) 创建；root 仅负责执行命令，目录所有者仍设为 media_rw。
+    runRoot("mkdir -p /data/media/0/$folderName 2>/dev/null; " +
+            "chown 1023:1023 /data/media/0/$folderName 2>/dev/null; " +
+            "chmod 0771 /data/media/0/$folderName 2>/dev/null")
 }
 
 

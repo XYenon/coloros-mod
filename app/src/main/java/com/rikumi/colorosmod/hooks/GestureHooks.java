@@ -23,6 +23,7 @@ import com.rikumi.colorosmod.xposed.XC_LoadPackage;
  * 手势导航(SystemUI)相关 hook：手势条高度、mBack 触摸与反馈、手势带防穿透。
  */
 public final class GestureHooks {
+    private static volatile boolean sImeVisible;
     // 判定为向左/右/上划动的阈值（dp），超过则放弃 MBack 接管。
     static final int MBACK_SWIPE_DP = 20;
     // 旋转按钮到屏幕两边的边距(dp)，与系统侧边距 oplus_floating_rotation_button_side_margin 同值，
@@ -298,6 +299,33 @@ public final class GestureHooks {
     // 「mBack 热区顶部 -> 窗口底部」这一段(设成整窗口会挡住底部整条), 并在同段内放全宽透明拦截层。
     public static void hookGestureTouchThrough(final XC_LoadPackage.LoadPackageParam lpparam) {
         try {
+            Class<?> navigationBarClass = XposedHelpers.findClass(
+                    "com.android.systemui.navigationbar.views.NavigationBar", lpparam.classLoader);
+            XposedHelpers.findAndHookMethod(navigationBarClass, "setImeWindowStatus",
+                    int.class, int.class, int.class, boolean.class, new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                Object helper = XposedHelpers.getObjectField(
+                                        param.thisObject, "mNavBarHelper");
+                                Object visible = XposedHelpers.callMethod(
+                                        helper, "isImeVisible", param.args[1]);
+                                sImeVisible = visible instanceof Boolean
+                                        && ((Boolean) visible).booleanValue();
+                                if (!sImeVisible) {
+                                    sImeVisible = XposedHelpers.getBooleanField(
+                                            param.thisObject, "mImeVisible");
+                                }
+                                Object navView = XposedHelpers.getObjectField(param.thisObject, "mView");
+                                if (navView instanceof android.view.View && sImeVisible) {
+                                    removeGestureBlockSurface((android.view.View) navView);
+                                }
+                            } catch (Throwable ignored) { }
+                        }
+                    });
+        } catch (Throwable t) {
+            dbg("gesture IME state hook failed: " + t);
+        }
+        try {
             // InternalInsetsInfo 为 @hide 类, 编译期不可见, 用反射访问。
             Class<?> insetsInfoClass = XposedHelpers.findClass(
                     "android.view.ViewTreeObserver$InternalInsetsInfo", null);
@@ -314,6 +342,21 @@ public final class GestureHooks {
                                 Object viewObj = XposedHelpers.getObjectField(navBar, "mView");
                                 if (viewObj instanceof android.view.View) {
                                     android.view.View view = (android.view.View) viewObj;
+                                    boolean navImeVisible = isImeVisible(view);
+                                    try {
+                                        navImeVisible = navImeVisible || XposedHelpers.getBooleanField(
+                                                navBar, "mImeVisible");
+                                    } catch (Throwable ignored) { }
+                                    syncGestureBlockSurface(view);
+                                    if (navImeVisible) {
+                                        Object imeRegion = XposedHelpers.getObjectField(info, "touchableRegion");
+                                        if (imeRegion instanceof android.graphics.Region) {
+                                            ((android.graphics.Region) imeRegion).set(
+                                                    0, 0, view.getWidth(), view.getHeight());
+                                        }
+                                        XposedHelpers.callMethod(info, "setTouchableInsets", 0);
+                                        return;
+                                    }
                                     // 通知中心/控制中心展开时保留系统原始区域, 不做任何拦截。
                                     if (!isGestureBlockActive(view)) return;
                                     // 触摸区域决定窗口真正拦截的范围(导航栏窗口实测 179px 高,
@@ -520,7 +563,9 @@ public final class GestureHooks {
         surface.setOnTouchListener(new android.view.View.OnTouchListener() {
             @Override
             public boolean onTouch(android.view.View view, android.view.MotionEvent event) {
-                return true;
+                // 输入法弹出后系统不一定触发一次新的 insets traversal；在事件入口再次判断，
+                // 避免旧拦截层继续吞掉导航栏的收起/切换键盘按钮。
+                return isGestureBlockActive(view);
             }
         });
         android.widget.FrameLayout.LayoutParams lp =
@@ -542,7 +587,53 @@ public final class GestureHooks {
     // 关则立即从视图树移除(否则残留到下次 SystemUI 重启)。通知/控制中心展开时一律不生效: 面板窗口
     // 已接管触摸, 继续吞掉手势带事件只会让面板底部区域点不动。
     static boolean isGestureBlockActive(android.view.View view) {
-        return readBool(KEY_GESTURE_TOUCH_THROUGH_ENABLED, false) && !isShadeExpanded(view);
+        return readBool(KEY_GESTURE_TOUCH_THROUGH_ENABLED, false)
+                && !isShadeExpanded(view) && !isImeVisible(view);
+    }
+
+    static boolean isImeVisible(android.view.View view) {
+        if (sImeVisible) return true;
+        if (view == null) return false;
+        try {
+            android.view.WindowInsets insets = view.getRootWindowInsets();
+            if (insets != null && insets.isVisible(android.view.WindowInsets.Type.ime())) return true;
+        } catch (Throwable ignored) { }
+        try {
+            android.graphics.Rect frame = new android.graphics.Rect();
+            view.getWindowVisibleDisplayFrame(frame);
+            return view.getRootView().getHeight() - frame.bottom > Math.round(120 * readDensity());
+        } catch (Throwable ignored) {
+        }
+        // 导航栏是独立窗口时 WindowInsets 不包含 IME；系统输入法管理器仍能反映当前编辑器状态。
+        try {
+            android.view.inputmethod.InputMethodManager imm =
+                    (android.view.inputmethod.InputMethodManager) view.getContext()
+                            .getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+            if (imm != null && imm.isAcceptingText()) return true;
+        } catch (Throwable ignored) { }
+        // ColorOS 导航栏把 IME 状态保存在 NavigationBar/NavigationBarView 对象字段中，
+        // 独立窗口的 Insets 与 IMM 在部分版本均不可见；读取命名明确的布尔状态作为兜底。
+        try {
+            Object current = view;
+            for (int depth = 0; current != null && depth < 5; depth++) {
+                Class<?> type = current.getClass();
+                while (type != null) {
+                    for (java.lang.reflect.Field field : type.getDeclaredFields()) {
+                        String name = field.getName().toLowerCase(java.util.Locale.ROOT);
+                        if (field.getType() == boolean.class
+                                && (name.contains("ime") || name.contains("keyboard")
+                                || name.contains("inputmethod"))) {
+                            field.setAccessible(true);
+                            if (field.getBoolean(current)) return true;
+                        }
+                    }
+                    type = type.getSuperclass();
+                }
+                current = current instanceof android.view.View
+                        ? ((android.view.View) current).getParent() : null;
+            }
+        } catch (Throwable ignored) { }
+        return false;
     }
 
     static void syncGestureBlockSurface(android.view.View handle) {

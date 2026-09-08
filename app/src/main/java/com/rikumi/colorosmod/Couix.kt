@@ -1093,7 +1093,7 @@ fun CouixItemDivider(modifier: Modifier = Modifier, startInset: Dp = COUIX_DIVID
 // 任一项切换时回调, 供顶层刷新主开关状态。
 @Composable
 internal fun CouixGroup(
-    items: List<SwitchItem>,
+    items: List<SettingsItem>,
     prefs: SharedPreferences,
     ctx: Context,
     version: Int = 0,
@@ -1104,9 +1104,45 @@ internal fun CouixGroup(
     CouixCard(modifier = modifier) {
         items.forEachIndexed { index, item ->
             if (index > 0) CouixItemDivider()
-            CouixSwitchRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
+            when (item) {
+                is SwitchItem -> CouixSwitchRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
+                is FolderBlockItem -> CouixFolderBlockRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
+                is SelectItem -> CouixSelectRow(item = item, prefs = prefs, ctx = ctx, version = version)
+                is GroupTitleItem -> Unit
+            }
         }
     }
+}
+
+@Composable
+private fun CouixFolderBlockRow(
+    item: FolderBlockItem,
+    prefs: SharedPreferences,
+    ctx: Context,
+    version: Int,
+    overrideValue: Boolean?,
+    onItemChanged: () -> Unit,
+) {
+    var checked by remember(item.key, version) {
+        mutableStateOf(overrideValue ?: prefs.getBoolean(item.key, false))
+    }
+    val scope = rememberCoroutineScope()
+    CouixSwitchPreference(
+        checked = checked,
+        onCheckedChange = {
+            checked = it
+            setBool(ctx, item.key, it)
+            if (it) scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                deleteEmptyMediaFolder(item.folderName)
+            } else {
+                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                    createMediaFolder(item.folderName)
+                }
+            }
+            onItemChanged()
+        },
+        title = item.label,
+    )
 }
 
 @Composable
