@@ -246,6 +246,15 @@
   View, float, NotificationMenuRowPlugin)`，before 里对 `ExpandableNotificationRow` 直接返回 true，
   使 `NotificationSwipeHelper#handleMenuRowSwipe` 跳过"吸附露出菜单"分支、走 dismiss / snapClosed。
 - 不 hook `FeatureOption.isExpRegion()`：全 SystemUI 有 150+ 处调用，影响面不可控。
+- **左滑振动的屏蔽点**（2026-09-08 核对）：振动来自 `NotificationMenuRow#onTouchMove`（源码 437-444 行），
+  `canBeDismissed()` 且 `mSnappingToDismiss` 翻转那一刻调
+  `mNotificationMenuRowExt.performHapticFeedback(getMenuView())`，对应"滑过可清除阈值"的触感。
+  hook `NotificationMenuRowExtImpl#performHapticFeedback(View)`，before 里判断方向后 `setResult(null)`。
+  方向只能取被拖动行本身：`NotificationMenuRowExtImpl` **没有 `mTranslation` 字段**（它在 `NotificationMenuRow` 里），
+  取字段抛 `NoSuchFieldError` 会让屏蔽静默失效；正确做法是 `getMenuRowParent()` 拿通知行后判位移为负
+  （`SwipeHelper` 先 `setTranslation` 再回调 `menuRow.onTouchMove`，故读到的是当前实际位移）。
+  位移有**两套来源**必须都看：`ExpandableView#getTranslation()`（Oplus 滑动主要写这个）和 `View#getTranslationX()`
+  （只写后者时前者为 0，只看 `getTranslationX()` 会漏判，实测左滑仍有振动）。
 
 **通知下滑展开** `notification_pull_expand_enabled`
 
