@@ -373,6 +373,11 @@ public final class NotificationHooks {
                     + Log.getStackTraceString(t));
         }
 
+// 左滑越过"可清除"阈值时的振动(NotificationMenuRow#onTouchMove, 源码 437-444 行:
+// canBeDismissed() 下 mSnappingToDismiss 由 false 翻 true 的那一刻调
+// mNotificationMenuRowExt.performHapticFeedback(getMenuView()))。
+// 方向只能从被拖动的通知行本身取: NotificationMenuRowExtImpl 里没有 mTranslation 字段
+// (它在 NotificationMenuRow 里), 取字段会抛 NoSuchFieldError 导致屏蔽完全失效。
         try {
             XposedHelpers.findAndHookMethod(
                     "com.oplus.systemui.notification.row.NotificationMenuRowExtImpl",
@@ -381,10 +386,31 @@ public final class NotificationHooks {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             if (!readBool(KEY_NOTIFICATION_SWIPE_TO_DISMISS_ENABLED, false)) return;
-                            Object translation = XposedHelpers.getObjectField(
-                                    param.thisObject, "mTranslation");
-                            if (translation instanceof Number
-                                    && ((Number) translation).floatValue() < 0.0f) param.setResult(null);
+                            try {
+                                // SwipeHelper 先 setTranslation 再回调 menuRow.onTouchMove,
+                                // 因此这里读到的就是当前实际位移; 只拦左滑(位移为负)。
+                                // 通知行的位移有两套来源, 任一为负即判左滑:
+                                //   - ExpandableView#getTranslation()(Oplus 侧滑动主要写这个)
+                                //   - View#getTranslationX()
+                                Object row = XposedHelpers.callMethod(
+                                        param.thisObject, "getMenuRowParent");
+                                float translation = 0.0f;
+                                try {
+                                    Object value = XposedHelpers.callMethod(row, "getTranslation");
+                                    if (value instanceof Number) {
+                                        translation = ((Number) value).floatValue();
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                                if (translation < 0.0f
+                                        || (row instanceof View
+                                                && ((View) row).getTranslationX() < 0.0f)) {
+                                    param.setResult(null);
+                                    log("notification_swipe_to_dismiss haptic blocked: " + translation);
+                                }
+                            } catch (Throwable t) {
+                                log("notification_swipe_to_dismiss haptic fail: " + t);
+                            }
                         }
                     });
             log("HOOK OK NotificationMenuRowExtImpl#performHapticFeedback (swipe dismiss)");
