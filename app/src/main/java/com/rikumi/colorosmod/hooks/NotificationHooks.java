@@ -336,6 +336,62 @@ public final class NotificationHooks {
             log("HOOK FAIL OplusSwipeHelperExImpl#shouldNotShowMenuExt :: "
                     + Log.getStackTraceString(t));
         }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.android.systemui.statusbar.notification.stack.NotificationSwipeHelper",
+                    lpparam.classLoader, "handleMenuRowSwipe", MotionEvent.class, View.class,
+                    float.class, "com.android.systemui.plugins.statusbar.NotificationMenuRowPlugin",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!readBool(KEY_NOTIFICATION_SWIPE_TO_DISMISS_ENABLED, false)) return;
+                                View row = (View) param.args[1];
+                                if (!isExpandableNotificationRow(row)) return;
+                                float velocityX = ((Number) param.args[2]).floatValue();
+                                // 右滑完整保留系统原有逻辑；左滑仅补齐同口径的速度清除路径。
+                                if (velocityX >= 0.0f) return;
+                                float escapeVelocity = ((Number) XposedHelpers.callMethod(
+                                        param.thisObject, "getEscapeVelocity")).floatValue();
+                                if (velocityX < -escapeVelocity) {
+                                    XposedHelpers.callMethod(param.thisObject, "dismiss", row, velocityX);
+                                } else {
+                                    XposedHelpers.callMethod(param.thisObject, "snapClosed", row,
+                                            velocityX);
+                                    XposedHelpers.callMethod(param.args[3], "onSnapClosed");
+                                }
+                                param.setResult(null);
+                            } catch (Throwable t) {
+                                log("notification_swipe_to_dismiss handleMenuRowSwipe fail: " + t);
+                            }
+                        }
+                    });
+            log("HOOK OK NotificationSwipeHelper#handleMenuRowSwipe (left velocity)");
+        } catch (Throwable t) {
+            log("HOOK FAIL NotificationSwipeHelper#handleMenuRowSwipe :: "
+                    + Log.getStackTraceString(t));
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                    "com.oplus.systemui.notification.row.NotificationMenuRowExtImpl",
+                    lpparam.classLoader, "performHapticFeedback", View.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            if (!readBool(KEY_NOTIFICATION_SWIPE_TO_DISMISS_ENABLED, false)) return;
+                            Object translation = XposedHelpers.getObjectField(
+                                    param.thisObject, "mTranslation");
+                            if (translation instanceof Number
+                                    && ((Number) translation).floatValue() < 0.0f) param.setResult(null);
+                        }
+                    });
+            log("HOOK OK NotificationMenuRowExtImpl#performHapticFeedback (swipe dismiss)");
+        } catch (Throwable t) {
+            log("HOOK FAIL NotificationMenuRowExtImpl#performHapticFeedback :: "
+                    + Log.getStackTraceString(t));
+        }
     }
 
 // 通知下滑展开(走海外/一加 OxygenOS 的 exp 分支)。
