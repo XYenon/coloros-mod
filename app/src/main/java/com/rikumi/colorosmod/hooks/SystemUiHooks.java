@@ -74,6 +74,7 @@ public final class SystemUiHooks {
         KeyguardHooks.hookKeyguardNotificationOffset(lpparam, density);
         // 输入密码界面支持侧滑或下滑返回: 运行时按 KEY_KEYGUARD_BOUNCER_SWIPE_BACK_ENABLED 门控。
         KeyguardHooks.hookBouncerSwipeBack(lpparam);
+        KeyguardHooks.hookKeyguardNoChargeAnim(lpparam);
         // 密码支持滑动输入: 运行时按 KEY_KEYGUARD_SLIDE_INPUT_ENABLED 门控。
         PasswordInputHooks.hookKeyguardSlideInput(lpparam);
         // 支持魅族状态栏歌词: 运行时按 KEY_STATUSBAR_LYRIC_ENABLED 门控。

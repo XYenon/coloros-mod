@@ -275,6 +275,8 @@ public class XposedInit extends XposedModule {
     // 显示按下态; 离开该键范围则取消(不重复输入)。见 SystemUiHooks#hookKeyguardSlideInput ——
     // 接管 COUINumericKeyboard 的 handleActionDown/Move/Up, 改"矩形命中+抬起才输入"为"圆形命中+进入即输入"。
     public static final String KEY_KEYGUARD_SLIDE_INPUT_ENABLED = "keyguard_slide_input_enabled";
+    public static final String KEY_KEYGUARD_NO_CHARGE_ANIM_ENABLED =
+            "keyguard_no_charge_anim_enabled";
 
     // 跨进程读取开关用的应用 Context(被 hook 进程自身)与 ContentProvider 通道所需的字段。
     public static volatile android.content.Context sAppContext;

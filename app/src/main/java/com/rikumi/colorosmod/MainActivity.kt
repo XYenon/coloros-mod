@@ -231,6 +231,7 @@ private val LOCKSCREEN: List<SettingsItem> = listOf(
     SwitchItem("keyguard_no_light_effect_enabled", "取消密码界面控件光效", "模拟恢复 ColorOS 15 效果"),
     SwitchItem("keyguard_bouncer_brightness_enabled", "自定义密码界面背景亮度", sliderKey = "keyguard_bouncer_brightness", sliderMax = 5, sliderDefault = 0, sliderUnit = "%"),
     SwitchItem("keyguard_notification_offset_enabled", "锁屏通知区域下移", sliderKey = "keyguard_notification_offset_dp", sliderMax = 40, sliderDefault = 20),
+    SwitchItem("keyguard_no_charge_anim_enabled", "取消锁屏充电动画"),
 )
 
 // 首页的一个分类入口: id 用于页面栈定位, title 为首页/子页面标题, icon 取 miuix 扩展图标。

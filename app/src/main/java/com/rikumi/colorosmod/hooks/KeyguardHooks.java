@@ -454,4 +454,23 @@ public final class KeyguardHooks {
             return false;
         }
     }
+    private static final String CLS_CHARGING_ANIMATION_IMPL =
+            "com.oplus.systemui.keyguard.charginganim.ChargingAnimationImpl";
+
+    public static void hookKeyguardNoChargeAnim(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            XposedHelpers.findAndHookMethod(CLS_CHARGING_ANIMATION_IMPL, lpparam.classLoader,
+                    "updateAnimeState", int.class, String.class, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (readBool(KEY_KEYGUARD_NO_CHARGE_ANIM_ENABLED, false)
+                            && param.args[0] instanceof Integer
+                            && ((Integer) param.args[0]) == 1) param.setResult(null);
+                }
+            });
+            log("HOOK OK ChargingAnimationImpl#updateAnimeState (keyguard_no_charge_anim)");
+        } catch (Throwable t) {
+            log("HOOK FAIL ChargingAnimationImpl#updateAnimeState :: " + Log.getStackTraceString(t));
+        }
+    }
 }
