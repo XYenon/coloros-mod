@@ -15,6 +15,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -1104,15 +1106,25 @@ internal fun CouixGroup(
     CouixCard(modifier = modifier) {
         items.forEachIndexed { index, item ->
             if (index > 0) CouixItemDivider()
-            when (item) {
-                is SwitchItem -> CouixSwitchRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
-                is FolderBlockItem -> CouixFolderBlockRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
-                is SelectItem -> CouixSelectRow(item = item, prefs = prefs, ctx = ctx, version = version)
-                is GroupTitleItem -> Unit
+            androidx.compose.runtime.key(item.keyForCompose) {
+                when (item) {
+                    is SwitchItem -> CouixSwitchRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
+                    is FolderBlockItem -> CouixFolderBlockRow(item = item, prefs = prefs, ctx = ctx, version = version, overrideValue = overrideValue, onItemChanged = onItemChanged)
+                    is SelectItem -> CouixSelectRow(item = item, prefs = prefs, ctx = ctx, version = version)
+                    is GroupTitleItem -> Unit
+                }
             }
         }
     }
 }
+
+private val SettingsItem.keyForCompose: String
+    get() = when (this) {
+        is SwitchItem -> key
+        is FolderBlockItem -> key
+        is SelectItem -> key
+        is GroupTitleItem -> "group:$title"
+    }
 
 @Composable
 private fun CouixFolderBlockRow(
@@ -1413,6 +1425,7 @@ fun CouixMasterToggle(
 fun CouixSlider(
     value: Float,
     onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val primary = MiuixTheme.colorScheme.primary
@@ -1426,13 +1439,14 @@ fun CouixSlider(
             .pointerInput(Unit) {
                 detectTapGestures { offset ->
                     val range = size.width.coerceAtLeast(1)
-                    onValueChange((offset.x / range).coerceIn(0f, 1f))
+                onValueChange((offset.x / range).coerceIn(0f, 1f))
+                onValueChangeFinished()
                 }
             }
             .pointerInput(Unit) {
                 detectHorizontalDragGestures(
                     onDragStart = { },
-                    onDragEnd = { },
+                    onDragEnd = { onValueChangeFinished() },
                     onDragCancel = { },
                 ) { change, _ ->
                     change.consume()
@@ -1681,17 +1695,31 @@ private fun CouixSwitchRow(
     overrideValue: Boolean?,
     onItemChanged: () -> Unit,
 ) {
+    val scope = rememberCoroutineScope()
     // overrideValue 非空时优先显示覆盖值(主开关动画期间), 否则读 prefs;
     // version/overrideValue 变化时重新计算, 其余时刻用本地状态即时切换。
     var checked by remember(item.key, version, overrideValue) {
-        mutableStateOf(overrideValue ?: prefs.getBoolean(item.key, false))
+        mutableStateOf(overrideValue ?: if (item.rootBacked) false else prefs.getBoolean(item.key, false))
+    }
+    var rootValue by remember(item.key, version) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(item.key) {
+        if (item.rootBacked) {
+            val result = withContext(Dispatchers.IO) { readSystemSetting(item.key) }
+            if (result != null) {
+                checked = result.first
+                rootValue = result.second
+            }
+        }
     }
     if (item.sliderKey == null) {
         CouixSwitchPreference(
             checked = checked,
             onCheckedChange = {
                 checked = it
-                setBool(ctx, item.key, it)
+                if (!item.rootBacked) setBool(ctx, item.key, it)
+                scope.launch(Dispatchers.IO) {
+                    applySystemSetting(item.key, it, item.sliderDefault)
+                }
                 onItemChanged()
             },
             title = item.label,
@@ -1702,18 +1730,26 @@ private fun CouixSwitchRow(
     // 带滑条的设置项: 数值显示在标题行右侧, 滑条默认折叠; 单独开启功能时自动展开。
     var expanded by remember(item.key) { mutableStateOf(false) }
     var intVal by remember(item.sliderKey, item.sliderMin, item.sliderMax, version, overrideValue) {
-        mutableStateOf(prefs.getInt(item.sliderKey, item.sliderDefault).coerceIn(item.sliderMin, item.sliderMax))
+        mutableStateOf((rootValue ?: prefs.getInt(item.sliderKey, item.sliderDefault)).coerceIn(item.sliderMin, item.sliderMax))
     }
+    LaunchedEffect(rootValue) {
+        if (item.rootBacked && rootValue != null) intVal = rootValue!!
+    }
+    val stepCount = ((item.sliderMax - item.sliderMin) / item.sliderStep).coerceAtLeast(1)
     Column(modifier = Modifier.fillMaxWidth()) {
         CouixSwitchPreference(
             checked = checked,
             onCheckedChange = {
                 checked = it
                 expanded = it
-                setBool(ctx, item.key, it)
+                if (!item.rootBacked) setBool(ctx, item.key, it)
+                if (item.rootBacked) rootValue = item.sliderDefault
                 if (!it) {
                     intVal = item.sliderDefault
-                    setInt(ctx, item.sliderKey, item.sliderDefault)
+                    if (!item.rootBacked) setInt(ctx, item.sliderKey, item.sliderDefault)
+                }
+                scope.launch(Dispatchers.IO) {
+                    applySystemSetting(item.key, it, item.sliderDefault)
                 }
                 onItemChanged()
             },
@@ -1727,7 +1763,11 @@ private fun CouixSwitchRow(
             leftTrailingContent = {
                 if (checked) {
                     BasicText(
-                        text = "${intVal}${item.sliderUnit}",
+                        text = if (item.sliderDisplayScale == 1f) {
+                            "${intVal}${item.sliderUnit}"
+                        } else {
+                            String.format(java.util.Locale.US, "%.2f%s", intVal * item.sliderDisplayScale, item.sliderUnit)
+                        },
                         style = MiuixTheme.textStyles.body2.copy(
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             textAlign = androidx.compose.ui.text.style.TextAlign.End,
@@ -1759,12 +1799,19 @@ private fun CouixSwitchRow(
                     value = ((intVal - item.sliderMin).toFloat() /
                             (item.sliderMax - item.sliderMin).coerceAtLeast(1)).coerceIn(0f, 1f),
                     onValueChange = { f ->
-                        val nv = (item.sliderMin + f * (item.sliderMax - item.sliderMin))
-                            .roundToInt().coerceIn(item.sliderMin, item.sliderMax)
+                        val nv = (item.sliderMin + (f * stepCount).roundToInt() * item.sliderStep)
+                            .coerceIn(item.sliderMin, item.sliderMax)
                         if (nv != intVal) {
                             intVal = nv
-                            setInt(ctx, item.sliderKey, nv)
+                            if (!item.rootBacked) {
+                                setInt(ctx, item.sliderKey, nv)
+                            }
                         }
+                    },
+                    onValueChangeFinished = if (item.rootBacked) {
+                        { scope.launch(Dispatchers.IO) { applySystemSetting(item.key, true, intVal) } }
+                    } else {
+                        {}
                     },
                     modifier = Modifier
                         .weight(1f)

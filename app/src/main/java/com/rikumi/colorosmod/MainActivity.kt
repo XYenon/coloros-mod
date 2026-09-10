@@ -67,6 +67,7 @@ import top.yukonga.miuix.kmp.theme.darkColorScheme
 import top.yukonga.miuix.kmp.theme.lightColorScheme
 import java.io.DataOutputStream
 import java.io.File
+import java.util.Locale
 import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -130,6 +131,9 @@ internal data class SwitchItem(
     val sliderDefault: Int = 0,
     val sliderUnit: String = "dp",
     val sliderMin: Int = 0,
+    val sliderStep: Int = 1,
+    val sliderDisplayScale: Float = 1f,
+    val rootBacked: Boolean = false,
 ) : SettingsItem
 
 // MediaProvider 默认目录屏蔽项。它不参与分类/全局主开关，只保存用户选择；开启时仅尝试
@@ -223,6 +227,8 @@ private val NAV: List<SettingsItem> = listOf(
     SwitchItem("mback_enabled", "启用 mBack", "点击手势条返回，长按回桌面"),
     SwitchItem("gesture_touch_through_enabled", "避免手势区域点击穿透"),
     SwitchItem("rotation_button_fixed_position_enabled", "优化屏幕旋转建议按钮位置", "位于建议旋转前后屏幕底边的夹角"),
+    SwitchItem("long_press_timeout_enabled", "修改系统长按超时", sliderKey = "long_press_timeout_ms", sliderMax = 600, sliderDefault = 300, sliderUnit = "ms", sliderMin = 100, sliderStep = 50, rootBacked = true),
+    SwitchItem("animation_duration_scale_enabled", "微调系统动画时长", sliderKey = "animation_duration_scale", sliderMax = 20, sliderDefault = 15, sliderUnit = "倍", sliderDisplayScale = 0.05f, rootBacked = true),
     GroupTitleItem("手势视觉"),
     SwitchItem("gesture_bar_width_enabled", "调整手势滑动条宽度", sliderKey = "gesture_bar_width_dp", sliderMax = 120, sliderDefault = 100, sliderUnit = "dp", sliderMin = 80),
     SwitchItem("gesture_bar_long_press_disable_enabled", "禁止手势条动画效果", "理论可解决 OxygenOS 关不掉助手动画的问题"),
@@ -387,8 +393,12 @@ fun SettingsScreen() {
                     items.forEach { item ->
                     when (item) {
                         is SwitchItem -> {
-                            setBool(ctx, item.key, target)
-                            if (!target) item.sliderKey?.let { setInt(ctx, it, item.sliderDefault) }
+                            if (item.rootBacked) {
+                                applySystemSetting(item.key, target, item.sliderDefault)
+                            } else {
+                                setBool(ctx, item.key, target)
+                                if (!target) item.sliderKey?.let { setInt(ctx, it, item.sliderDefault) }
+                            }
                         }
                         is FolderBlockItem -> {
                             setBool(ctx, item.key, target)
@@ -855,6 +865,43 @@ internal fun setBool(ctx: Context, key: String, value: Boolean) {
 
 internal fun setInt(ctx: Context, key: String, value: Int) {
     ctx.settingsPrefs().edit().putInt(key, value).commit()
+}
+
+// 需要系统权限的设置直接由 root 写入系统 Settings。动画倍率以 0..20 的整数保存，
+// 对应 0.00..1.00，避免浮点数在 SharedPreferences 中产生跨进程类型差异。
+internal fun applySystemSetting(key: String, enabled: Boolean, value: Int) {
+    when (key) {
+        "long_press_timeout_enabled" -> {
+            val timeout = if (enabled) value.coerceIn(100, 600) else 500
+            runRoot("settings put secure long_press_timeout $timeout")
+        }
+        "animation_duration_scale_enabled" -> {
+            val scale = if (enabled) value.coerceIn(0, 20) * 0.05f else 1f
+            val text = String.format(Locale.US, "%.2f", scale)
+            runRoot(
+                "settings put global window_animation_scale $text; " +
+                    "settings put global transition_animation_scale $text; " +
+                    "settings put global animator_duration_scale $text"
+            )
+        }
+    }
+}
+
+internal fun readSystemSetting(key: String): Pair<Boolean, Int>? {
+    return when (key) {
+        "long_press_timeout_enabled" -> {
+            val value = runRoot("settings get secure long_press_timeout")?.trim()?.toIntOrNull()
+                ?: return null
+            Pair(value != 500, value.coerceIn(100, 600))
+        }
+        "animation_duration_scale_enabled" -> {
+            val raw = runRoot("settings get global animator_duration_scale")?.trim()
+                ?: return null
+            val scale = raw.toFloatOrNull() ?: return null
+            Pair(scale != 1f, (scale / 0.05f).toInt().coerceIn(0, 20))
+        }
+        else -> null
+    }
 }
 
 // 只删除指定的标准一级目录，并使用 rmdir 保证目录非空时绝不删除任何内容。
