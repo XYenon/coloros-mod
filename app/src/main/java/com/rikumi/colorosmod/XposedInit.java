@@ -261,6 +261,12 @@ public class XposedInit extends XposedModule {
     // 放行系统侧滑返回手势; 并把"上滑使用指纹解锁"提示改为"下滑返回指纹解锁"。
     // 状态栏歌词: 数据源是 ColorOS 媒体接口的 metadata.lyricInfo, 无需注入音乐软件/伪装机型。
     public static final String KEY_STATUSBAR_LYRIC_ENABLED = "statusbar_lyric_enabled";
+    // 第三方状态栏歌词避让: 第三方悬浮窗左上角进入状态栏区域时隐藏系统时钟。
+    public static final String KEY_STATUSBAR_LYRIC_AVOID_THIRD_PARTY_ENABLED =
+            "statusbar_lyric_avoid_third_party_enabled";
+    // system_server 窗口变化通知序号, 仅作为 SystemUI ContentObserver 的事件信号。
+    public static final String KEY_STATUSBAR_OVERLAY_EVENT =
+            "colorosmod_statusbar_overlay_event";
     // 控制中心蓝牙磁贴显示降噪控制: 有可控制的降噪耳机时把蓝牙磁贴改成三段式(降噪/关闭/通透),
     // 复用系统三段式静音磁贴的整套渲染, 状态走欢律 EarphoneControlProvider。见 AncTileHooks。
     public static final String KEY_ANC_TILE_ENABLED = "anc_tile_enabled";
@@ -498,6 +504,8 @@ public class XposedInit extends XposedModule {
             SystemServerHooks.hookFloatWindowSizeLimits(lpparam);
             // system_server: 多任务上划彻底结束进程, 配合 LauncherHooks 的 removeTask 补调
             SystemServerHooks.hookRecentsSwipeUpKillSystemServer(lpparam);
+            // system_server: 第三方悬浮窗变化事件, 供状态栏歌词避让功能按事件刷新窗口信息。
+            SystemServerHooks.hookStatusBarThirdPartyOverlayEvents(lpparam);
         }
         // 状态栏歌词只需在 SystemUI 侧实现: 直接读 MediaSession 的标题,
         // 无需在音乐软件进程注入, 也无需伪装机型(见 StatusBarLyricHooks 类注释)。

@@ -4,6 +4,8 @@ import static com.rikumi.colorosmod.XposedInit.*;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.database.ContentObserver;
+import android.graphics.Rect;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.media.MediaMetadata;
@@ -13,11 +15,13 @@ import android.media.session.PlaybackState;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -105,6 +109,8 @@ public final class StatusBarLyricHooks {
     private static View[] sHideViews = null;
     private static int[] sHideOrigVisibility = null;
     private static boolean sHiddenByUs = false;
+    /** 第三方悬浮窗位于状态栏时独立隐藏时钟, 不影响本模块歌词容器。 */
+    private static boolean sHiddenByThirdParty = false;
 
     /** 状态栏根布局(PhoneStatusBarView): tick 里要按 id 找 cutout/流体云, 必须从根布局找。 */
     private static View sStatusBarRoot = null;
@@ -122,6 +128,11 @@ public final class StatusBarLyricHooks {
     private static boolean sNumberModeOn = false;
 
     private static volatile Handler sMainHandler = null;
+    private static boolean sThirdPartyMonitorStarted = false;
+    /** 事件通知正常覆盖增删/移动；该低频检查只用于设置切换或事件丢失时的兜底。 */
+    private static final long THIRD_PARTY_MONITOR_INTERVAL_MS = 5000L;
+    private static boolean sThirdPartyObserverRegistered = false;
+    private static ContentObserver sThirdPartyWindowObserver = null;
     private static volatile MediaSessionManager sSessionManager = null;
     private static volatile boolean sMediaInited = false;
     private static final Set<MediaController> sRegistered = new HashSet<>();
@@ -209,6 +220,7 @@ public final class StatusBarLyricHooks {
         // 这里不再重复 hook, 避免两处各写一份造成互相拉扯(图标 <-> 数字来回跳)。
         hookStatusBarView(lpparam);
         hookQsExpansion(lpparam);
+        startThirdPartyOverlayMonitor();
     }
 
     // 歌词显示期间**强制**时钟保持隐藏。时钟可见性会被 SystemUI 在锁屏、下拉通知、Dock 等时机动态切换,
@@ -217,13 +229,185 @@ public final class StatusBarLyricHooks {
     private static final XC_MethodHook CLOCK_VISIBILITY_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
-            if (!sHiddenByUs) return;
             if (param.thisObject != sClockView) return;
+            if (!shouldHideClock()) {
+                sClockDesiredVisibility = (Integer) param.args[0];
+                return;
+            }
             int visibility = (Integer) param.args[0];
-            sClockDesiredVisibility = visibility;
+            // 强制写入 GONE 不能覆盖系统真正想要的可见性, 否则避让结束后无法恢复。
+            if (visibility != View.GONE) sClockDesiredVisibility = visibility;
             if (visibility != View.GONE) param.args[0] = View.GONE;
         }
     };
+
+    private static boolean shouldHideClock() {
+        return sHiddenByUs || sHiddenByThirdParty;
+    }
+
+    /** ColorOS 跨进程窗口服务, 可返回第三方应用窗口的包名、类型和屏幕矩形。 */
+    private static volatile Object sOplusWindowManager = null;
+
+    /**
+     * 轮询 ColorOS WindowManagerService 中的实际窗口。第三方状态栏歌词由应用进程创建，
+     * 因此必须通过系统服务的窗口信息跨进程读取；只要悬浮窗左上角落在状态栏矩形内，
+     * 就按用户设置隐藏时钟，窗口移走或消失后恢复系统可见性。
+     */
+    private static void startThirdPartyOverlayMonitor() {
+        if (sThirdPartyMonitorStarted) return;
+        sThirdPartyMonitorStarted = true;
+        if (sMainHandler == null) sMainHandler = new Handler(Looper.getMainLooper());
+        sMainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    checkThirdPartyOverlayNow();
+                } catch (Throwable t) {
+                    log("statusbar_lyric third-party overlay check error: "
+                            + Log.getStackTraceString(t));
+                    setThirdPartyClockHidden(false);
+                }
+                if (sMainHandler != null) {
+                    sMainHandler.postDelayed(this, THIRD_PARTY_MONITOR_INTERVAL_MS);
+                }
+            }
+        });
+    }
+
+    /** 在状态栏根视图可用后注册跨进程窗口变化事件。 */
+    private static void registerThirdPartyWindowObserver(Context context) {
+        if (sThirdPartyObserverRegistered || context == null) return;
+        try {
+            if (sMainHandler == null) sMainHandler = new Handler(Looper.getMainLooper());
+            sThirdPartyWindowObserver = new ContentObserver(sMainHandler) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    runOnMain(StatusBarLyricHooks::checkThirdPartyOverlayNow);
+                }
+            };
+            context.getContentResolver().registerContentObserver(
+                    Settings.Global.getUriFor(KEY_STATUSBAR_OVERLAY_EVENT), false,
+                    sThirdPartyWindowObserver);
+            sThirdPartyObserverRegistered = true;
+            log("statusbar_lyric third-party window observer registered");
+        } catch (Throwable t) {
+            log("statusbar_lyric third-party window observer error: "
+                    + Log.getStackTraceString(t));
+        }
+    }
+
+    private static void checkThirdPartyOverlayNow() {
+        boolean hidden = readBool(KEY_STATUSBAR_LYRIC_AVOID_THIRD_PARTY_ENABLED, false)
+                && hasThirdPartyOverlayInStatusBar();
+        setThirdPartyClockHidden(hidden);
+    }
+
+    /** 改变第三方避让状态时只操作时钟，不触碰本模块自己的歌词容器。 */
+    private static void setThirdPartyClockHidden(boolean hidden) {
+        if (hidden == sHiddenByThirdParty) return;
+        sHiddenByThirdParty = hidden;
+        View clock = sClockView;
+        if (clock == null) return;
+        if (hidden) {
+            clock.setVisibility(View.GONE);
+        } else if (!sHiddenByUs) {
+            clock.setVisibility(sClockDesiredVisibility);
+        }
+    }
+
+    private static boolean hasThirdPartyOverlayInStatusBar() {
+        View statusBar = sStatusBarRoot;
+        if (statusBar == null || statusBar.getVisibility() != View.VISIBLE || !statusBar.isShown()) {
+            return false;
+        }
+        int[] statusLoc = new int[2];
+        statusBar.getLocationOnScreen(statusLoc);
+        int statusLeft = statusLoc[0];
+        int statusRight = statusLeft + statusBar.getWidth();
+        int statusTop = statusLoc[1];
+        int statusHeight = statusBar.getHeight();
+        if (statusHeight <= 0) {
+            try {
+                int id = statusBar.getResources().getIdentifier(
+                        "status_bar_height", "dimen", "android");
+                if (id != 0) statusHeight = statusBar.getResources().getDimensionPixelSize(id);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (statusHeight <= 0) return false;
+        int statusBottom = statusTop + statusHeight;
+
+        try {
+            Object windowManager = getOplusWindowManager();
+            if (windowManager == null) return false;
+            Object infosObject = XposedHelpers.callMethod(windowManager, "getAllVisibleWindowInfo");
+            if (!(infosObject instanceof List)) return false;
+            for (Object info : (List<?>) infosObject) {
+                if (info == null) continue;
+                String owner = (String) XposedHelpers.getObjectField(info, "packageName");
+                if (TextUtils.isEmpty(owner)
+                        || MODULE_PACKAGE.equals(owner)
+                        || "com.android.systemui".equals(owner)) continue;
+                int type = safeGetIntField(info, "type", 0);
+                Object attrs = safeGetObjectField(info, "windowAttributes");
+                if (attrs != null) type = safeGetIntField(attrs, "type", type);
+                if (!isThirdPartyOverlayType(type)) continue;
+                Rect frame = safeGetObjectField(info, "mFrame") instanceof Rect
+                        ? (Rect) safeGetObjectField(info, "mFrame") : null;
+                if (frame == null || frame.isEmpty()) {
+                    frame = safeGetObjectField(info, "mBounds") instanceof Rect
+                            ? (Rect) safeGetObjectField(info, "mBounds") : null;
+                }
+                if (frame == null || frame.isEmpty()) continue;
+                // 只按左上角判断: 顶部边界在状态栏内即可, 符合第三方歌词悬浮窗的布局特征。
+                if (frame.left >= statusLeft && frame.left < statusRight
+                        && frame.top >= statusTop && frame.top < statusBottom) return true;
+            }
+        } catch (Throwable t) {
+            log("statusbar_lyric inspect OplusWindowManager error: "
+                    + Log.getStackTraceString(t));
+        }
+        return false;
+    }
+
+    private static Object getOplusWindowManager() {
+        Object cached = sOplusWindowManager;
+        if (cached != null) return cached;
+        try {
+            Class<?> clazz = XposedHelpers.findClass("android.view.OplusWindowManager", null);
+            Object created = XposedHelpers.callStaticMethod(clazz, "getInstance");
+            sOplusWindowManager = created;
+            return created;
+        } catch (Throwable t) {
+            log("statusbar_lyric create OplusWindowManager error: "
+                    + Log.getStackTraceString(t));
+            return null;
+        }
+    }
+
+    private static Object safeGetObjectField(Object object, String field) {
+        try {
+            return XposedHelpers.getObjectField(object, field);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static int safeGetIntField(Object object, String field, int fallback) {
+        try {
+            return XposedHelpers.getIntField(object, field);
+        } catch (Throwable ignored) {
+            return fallback;
+        }
+    }
+
+    private static boolean isThirdPartyOverlayType(int type) {
+        return type == WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                || type == WindowManager.LayoutParams.TYPE_PHONE
+                || type == WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+                || type == WindowManager.LayoutParams.TYPE_SYSTEM_ERROR
+                || type == WindowManager.LayoutParams.TYPE_PRIORITY_PHONE;
+    }
 
     // 状态栏前景色(深/浅)变化由 DarkIconDispatcher 推给各 DarkReceiver, 时钟是其中之一。
     // 在它刷色之后把颜色同步给歌词, 是最贴近系统口径的做法 —— 不用自己解析 tint/暗色强度。
@@ -304,6 +488,7 @@ public final class StatusBarLyricHooks {
 
     private static void attachLyricView(FrameLayout root) {
         sStatusBarRoot = root;
+        registerThirdPartyWindowObserver(root.getContext());
     // 宿主容器: 通知图标所在的 status_bar_start_side_content_for_fake(LinearLayout, 高 fill_parent)。
     // 歌词插在 notification_icon_area **之后**, 紧跟通知图标(数字)右边, 垂直位置与时钟一致。
         View clock = findSystemUiViewById(root, "clock");

@@ -154,6 +154,18 @@ public final class XposedHelpers {
         return unhooks;
     }
 
+    /** Hook 目标类自己声明的全部同名方法, 用于 OEM 重载签名不稳定的系统服务入口。 */
+    public static Set<XC_MethodHook.Unhook> hookAllMethods(Class<?> hookClass, String methodName,
+                                                            XC_MethodHook callback) {
+        Set<XC_MethodHook.Unhook> unhooks = new LinkedHashSet<XC_MethodHook.Unhook>();
+        for (Method method : hookClass.getDeclaredMethods()) {
+            if (method.getName().equals(methodName)) {
+                unhooks.add(hookExecutable(method, callback));
+            }
+        }
+        return unhooks;
+    }
+
     // ------------------------------------------------------------------ 方法查找
 
     public static Method findMethodExact(Class<?> clazz, String methodName, Class<?>... parameterTypes) {

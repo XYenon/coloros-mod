@@ -190,6 +190,7 @@ private val NOTIF: List<SettingsItem> = listOf(
     SwitchItem("notification_padding_enabled", "增加通知上下内边距", sliderKey = "notification_padding_dp", sliderMax = 8, sliderDefault = 4),
     GroupTitleItem("状态栏设置"),
     SwitchItem("statusbar_lyric_enabled", "状态栏显示歌词", "需播放器支持 MediaSession metadata.lyricInfo ColorOS 歌词能力，暂不支持魅族歌词能力"),
+    SwitchItem("statusbar_lyric_avoid_third_party_enabled", "避让第三方状态栏歌词", "开启后状态栏区域存在悬浮窗时隐藏时钟"),
     SwitchItem("fluid_cloud_keep_percent_enabled", "流体云出现时不隐藏电量百分比"),
 )
 private val HIDDEN: List<SettingsItem> = listOf(

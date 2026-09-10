@@ -9,6 +9,8 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 
 import java.lang.ref.WeakReference;
@@ -40,6 +42,78 @@ import com.rikumi.colorosmod.xposed.XC_LoadPackage;
  * system_server(android) 作用域的全部 hook：小窗贴边挂机、横屏小窗保持比例。
  */
 public final class SystemServerHooks {
+    /** 窗口变化合并通知: 避免 relayoutWindow 动画期间频繁触发跨进程查询。 */
+    private static final long STATUSBAR_OVERLAY_EVENT_DEBOUNCE_MS = 250L;
+    private static Handler sStatusBarOverlayEventHandler;
+    private static Context sStatusBarOverlayEventContext;
+    private static final Runnable sStatusBarOverlayEventRunnable = new Runnable() {
+        @Override
+        public void run() {
+            try {
+                Context context = sStatusBarOverlayEventContext;
+                if (context != null
+                        && readBool(KEY_STATUSBAR_LYRIC_AVOID_THIRD_PARTY_ENABLED, false)) {
+                    Settings.Global.putLong(context.getContentResolver(),
+                            KEY_STATUSBAR_OVERLAY_EVENT, SystemClock.uptimeMillis());
+                }
+            } catch (Throwable t) {
+                log("statusbar_lyric overlay event publish error: "
+                        + Log.getStackTraceString(t));
+            }
+        }
+    };
+
+    /**
+     * 监听 WindowManagerService 的窗口增删与重新布局。第三方悬浮窗在应用进程创建，
+     * 但最终必须经过此服务；这里只发布一个合并后的变化序号，窗口矩形仍由 SystemUI
+     * 收到事件后通过 OplusWindowManager 跨进程查询，避免高频轮询和传递窗口对象。
+     */
+    public static void hookStatusBarThirdPartyOverlayEvents(
+            final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            final Class<?> wmsClass = XposedHelpers.findClass(
+                    "com.android.server.wm.WindowManagerService", lpparam.classLoader);
+            final XC_MethodHook windowChanged = new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    scheduleStatusBarOverlayEvent(param.thisObject);
+                }
+            };
+            int hooked = 0;
+            for (String method : new String[]{"addWindow", "removeWindow", "relayoutWindow"}) {
+                int count = XposedBridge.hookAllMethods(wmsClass, method, windowChanged).size();
+                hooked += count;
+            }
+            log("HOOK OK WindowManagerService window events: " + hooked);
+        } catch (Throwable t) {
+            log("HOOK FAIL WindowManagerService window events :: "
+                    + Log.getStackTraceString(t));
+        }
+    }
+
+    private static void scheduleStatusBarOverlayEvent(Object windowManagerService) {
+        try {
+            if (sStatusBarOverlayEventContext == null && windowManagerService != null) {
+                Object context = XposedHelpers.getObjectField(windowManagerService, "mContext");
+                if (context instanceof Context) {
+                    sStatusBarOverlayEventContext = (Context) context;
+                }
+            }
+            if (sStatusBarOverlayEventContext == null) {
+                Context context = systemContext();
+                if (context != null) sStatusBarOverlayEventContext = context;
+            }
+            if (sStatusBarOverlayEventHandler == null) {
+                sStatusBarOverlayEventHandler = new Handler(Looper.getMainLooper());
+            }
+            sStatusBarOverlayEventHandler.removeCallbacks(sStatusBarOverlayEventRunnable);
+            sStatusBarOverlayEventHandler.postDelayed(
+                    sStatusBarOverlayEventRunnable, STATUSBAR_OVERLAY_EVENT_DEBOUNCE_MS);
+        } catch (Throwable t) {
+            log("statusbar_lyric schedule overlay event error: "
+                    + Log.getStackTraceString(t));
+        }
+    }
     // 贴边挂机: 拦 TaskExtImpl#moveTaskToBackForPanorama(只切后台), 让图标动画跑完并把任务留在前台。
     // 不可拦 exitFlexibleTaskWindowInnerLocked —— 图标成形/缩小动画在其 handleEvent() 内, 截断就卡在松手位置。
     // 同时把焦点交给小窗下方任务, 避免"窗口已 hide 但仍 focused"导致音量键无响应 / ANR。
