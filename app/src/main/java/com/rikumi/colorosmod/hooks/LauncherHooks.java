@@ -1550,7 +1550,18 @@ public final class LauncherHooks {
     static final float DRAWER_ICON_GAP_KEEP = 0.875f;
     static final int DISPLAY_ALL_APPS = 1;
 
-    // 用系统右侧 padding(未改过) 反推左侧: 扣掉字母条宽度。
+    // 只在当前页面实际显示右侧字母条时调整左侧 padding。分类页没有字母条，必须保留
+    // 系统原本对称的左右 padding。
+    static boolean drawerHasVisibleLetterScroller(android.view.View anchor) {
+        int id = anchor.getResources().getIdentifier(
+                "coui_fast_scroller", "id", "com.android.launcher");
+        if (id == 0) return false;
+        android.view.View scroller = anchor.getRootView().findViewById(id);
+        return scroller != null && scroller.getVisibility() == android.view.View.VISIBLE
+                && scroller.isShown();
+    }
+
+    // 用系统右侧 padding(未改过)反推左侧并扣掉字母条宽度。
     // 字母条布局写死 28dp, 不能按 View.getWidth() 取 —— 第一次 apply 时还没 layout。
     static int drawerAdjustedLeftPadding(int systemPx, float density) {
         int minLeft = Math.round(4f * density);
@@ -1559,8 +1570,8 @@ public final class LauncherHooks {
     }
 
     // 调整抽屉每行图标数量: 列数走 AllAppsParam / 系统 drawer_layout_columns 偏好;
-    // 图标尺寸按 4/列数缩放(只动抽屉 getter, 不动桌面 IconParam); 再把左侧 padding
-    // 减去字母索引条宽度, 让视觉左右留白对称。
+    // 图标尺寸按 4/列数缩放(只动抽屉 getter, 不动桌面 IconParam); 在显示字母索引条的
+    // 列表页把左侧 padding 减去字母条宽度，让视觉左右留白对称。
     public static void hookDrawerColumns(final XC_LoadPackage.LoadPackageParam lpparam) {
         XC_MethodHook forceColumns = new XC_MethodHook() {
             @Override
@@ -1635,16 +1646,16 @@ public final class LauncherHooks {
                                 android.graphics.Rect rect = (android.graphics.Rect) paddingObj;
                                 int system = rect.right > 0 ? rect.right : rect.left;
                                 if (system <= 0) return;
-                                float density = readDensity();
-                                try {
-                                    Object rv = XposedHelpers.getObjectField(
-                                            param.thisObject, "mRecyclerView");
-                                    if (rv instanceof android.view.View) {
-                                        density = ((android.view.View) rv).getResources()
-                                                .getDisplayMetrics().density;
-                                    }
-                                } catch (Throwable ignored) {
+                                Object rv = XposedHelpers.getObjectField(
+                                        param.thisObject, "mRecyclerView");
+                                if (!(rv instanceof android.view.View)) return;
+                                android.view.View recyclerView = (android.view.View) rv;
+                                if (!drawerHasVisibleLetterScroller(recyclerView)) {
+                                    rect.left = system;
+                                    return;
                                 }
+                                float density = recyclerView.getResources()
+                                        .getDisplayMetrics().density;
                                 rect.left = drawerAdjustedLeftPadding(system, density);
                             } catch (Throwable t) {
                                 log("drawer applyPadding left adjust error: " + t);
@@ -1679,7 +1690,9 @@ public final class LauncherHooks {
                             } catch (Throwable ignored) {
                             }
                             int system = Math.max(0, right - extra);
-                            int want = extra + drawerAdjustedLeftPadding(system, density);
+                            int want = drawerHasVisibleLetterScroller(v)
+                                    ? extra + drawerAdjustedLeftPadding(system, density)
+                                    : right;
                             if (v.getPaddingLeft() == want) return;
                             v.setPadding(want, v.getPaddingTop(), right, v.getPaddingBottom());
                         }
