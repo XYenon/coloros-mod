@@ -59,6 +59,9 @@ jobs:
           perl -0pi -e "s/versionCode \d+/versionCode $VERSION_CODE/; s/versionName '[0-9.]+'/versionName '$VERSION'/" app/build.gradle
           grep -E "versionCode|versionName" app/build.gradle
 
+      - name: Install APK verification tools
+        run: sdkmanager 'build-tools;36.0.0'
+
       - name: Restore persistent signing key
         env:
           ANDROID_SIGNING_BUNDLE: ${{ secrets.ANDROID_SIGNING_BUNDLE }}
