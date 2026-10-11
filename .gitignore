@@ -10,3 +10,8 @@
 app/build
 *.log
 /sysui_src
+
+# Private APK signing material
+/signing.properties
+/signing/*.keystore
+/signing/*.jks
